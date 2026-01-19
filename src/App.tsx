@@ -184,7 +184,7 @@ export default function App() {
   const [laborPerHour, setLaborPerHour] = useState(31); // PLN / h
 
   // Cena sprzedazy
-  const [marginPercent, setMarginPercent] = useState(30); // %
+  const [marginPercent, setMarginPercent] = useState(250); // %
   const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
 
   // Maszyna (uproczony model czasu/energii)
