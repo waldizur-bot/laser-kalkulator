@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 
 /**
  * Prototyp webowej aplikacji do:
@@ -7,6 +9,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - prostego nestingu (heurystyka: shelf/row packing) na arkuszu
  * - wyliczania ceny kazdego projektu osobno (material + energia + amortyzacja + robocizna)
  * - eksportu ulozenia do SVG (do ponownego otwarcia w LightBurn)
+ * - eksportu PDF dla klienta z wycena
  */
 
 // ------------------------- Helpers -------------------------
@@ -98,6 +101,24 @@ function downloadText(filename: string, text: string) {
   URL.revokeObjectURL(url);
 }
 
+function fmtPLN(n: number) {
+  return `${n.toFixed(2)} PLN`;
+}
+
+function nowStamp() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  return {
+    date: `${yyyy}-${mm}-${dd}`,
+    time: `${hh}:${mi}`,
+    id: `WYC-${yyyy}${mm}${dd}-${hh}${mi}`,
+  };
+}
+
 // ------------------------- Types -------------------------
 
 type Design = {
@@ -141,7 +162,7 @@ export default function App() {
   const [kerf, setKerf] = useState(0.15); // mm
   const [padding, setPadding] = useState(2); // mm
 
-  // Materiały (profile w stanie, żeby dało się edytować cenę arkusza)
+  // Materialy
   const [materials, setMaterials] = useState<MaterialProfile[]>(MATERIALS_DEFAULT);
   const [materialId, setMaterialId] = useState<string>(MATERIALS_DEFAULT[0].id);
 
@@ -162,7 +183,7 @@ export default function App() {
   const [deprPerHour, setDeprPerHour] = useState(12); // PLN / h
   const [laborPerHour, setLaborPerHour] = useState(45); // PLN / h
 
-  // Cena sprzedaży
+  // Cena sprzedazy
   const [marginPercent, setMarginPercent] = useState(10); // %
   const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
 
@@ -170,7 +191,7 @@ export default function App() {
   const [laserWatt, setLaserWatt] = useState(60); // W
   const [assistWatt, setAssistWatt] = useState(20); // W
   const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt
-  const [setupMinutes, setSetupMinutes] = useState(6); // min / zamówienie
+  const [setupMinutes, setSetupMinutes] = useState(6); // min / zamowienie
 
   // Projekty
   const [designs, setDesigns] = useState<Design[]>([]);
@@ -268,10 +289,21 @@ export default function App() {
 
   const sheetArea = sheetW * sheetH; // mm2
 
+  // PLN / mm2
   const materialShare = useMemo(() => {
     if (!nesting.ok || instances.length === 0) return 0;
-    return sheetCost / Math.max(1e-9, sheetArea); // PLN / mm2
+    return sheetCost / Math.max(1e-9, sheetArea);
   }, [nesting.ok, instances.length, sheetCost, sheetArea]);
+
+  // NOWE: wykorzystanie arkusza i koszt materialu dla zamowienia
+  const materialUsage = useMemo(() => {
+    if (instances.length === 0) return 0;
+    return clamp(totalArea / Math.max(1e-9, sheetArea), 0, 1);
+  }, [instances.length, totalArea, sheetArea]);
+
+  const materialCostOrder = useMemo(() => {
+    return sheetCost * materialUsage; // PLN
+  }, [sheetCost, materialUsage]);
 
   const timeAndEnergyTotals = useMemo(() => {
     let minutes = setupMinutes;
@@ -292,17 +324,19 @@ export default function App() {
     const depr = timeAndEnergyTotals.hours * deprPerHour;
     const labor = timeAndEnergyTotals.hours * laborPerHour;
 
-    // total = koszty czasu i energii (jak było wcześniej)
     return { energy, depr, labor, total: energy + depr + labor };
   }, [timeAndEnergyTotals, powerPrice, deprPerHour, laborPerHour]);
 
-  // NOWE: cena końcowa zamówienia (koszt produkcji + marża, min. cena)
+  // NOWE: koszt produkcji (czas+energia + material)
+  const productionCost = useMemo(() => {
+    return orderCosts.total + materialCostOrder;
+  }, [orderCosts.total, materialCostOrder]);
+
+  // NOWE: cena koncowa z marza i min cena
   const finalPrice = useMemo(() => {
-    // tu możesz w przyszłości dodać też narzut materiału/odpadu albo stałą opłatę
-    const productionCost = orderCosts.total; // aktualnie: energia+amortyzacja+robocizna (materiał jest rozbijany per sztuka)
     const withMargin = productionCost * (1 + marginPercent / 100);
     return Math.max(withMargin, minOrderPrice);
-  }, [orderCosts.total, marginPercent, minOrderPrice]);
+  }, [productionCost, marginPercent, minOrderPrice]);
 
   const perItemPrice = useMemo(() => {
     if (instances.length === 0) return new Map<string, number>();
@@ -317,7 +351,7 @@ export default function App() {
       sumM += m;
     }
 
-    const timeCostPool = orderCosts.total; // energia + depr + labor
+    const timeCostPool = orderCosts.total;
 
     const out = new Map<string, number>();
     for (const it of instances) {
@@ -404,6 +438,54 @@ export default function App() {
     downloadText("layout_export.svg", out);
   }
 
+  function exportPdfClient() {
+    const { id, date, time } = nowStamp();
+
+    // Skalujemy pozycje tak, aby suma pozycji = finalPrice (z marza + min)
+    const baseSum = groupedPrices.reduce((acc, r) => acc + r.total, 0);
+    const multiplier = baseSum > 0 ? finalPrice / baseSum : 1;
+
+    const rows = groupedPrices.map((r) => {
+      const unit = r.unit * multiplier;
+      const total = r.total * multiplier;
+      return [r.name, String(r.qty), fmtPLN(unit), fmtPLN(total)];
+    });
+
+    const doc = new jsPDF({ unit: "mm", format: "a4" });
+
+    doc.setFontSize(16);
+    doc.text("WYCENA - LASER CO2", 14, 16);
+
+    doc.setFontSize(10);
+    doc.text(`Numer: ${id}`, 14, 24);
+    doc.text(`Data: ${date} ${time}`, 14, 29);
+    doc.text(`Material: ${selectedMaterial.name}`, 14, 34);
+    doc.text(`Arkusz: ${sheetW} x ${sheetH} mm`, 14, 39);
+
+    autoTable(doc, {
+      startY: 46,
+      head: [["Projekt", "Ilosc", "Cena / szt", "Suma"]],
+      body: rows.length ? rows : [["(brak)", "-", "-", "-"]],
+      styles: { fontSize: 10 },
+      headStyles: { fillColor: [240, 240, 240], textColor: 20 },
+    });
+
+    const y = (doc as any).lastAutoTable?.finalY ?? 46;
+
+    doc.setFontSize(11);
+    doc.text(`RAZEM: ${fmtPLN(finalPrice)}`, 14, y + 10);
+
+    doc.setFontSize(9);
+    doc.text(`Material (proporcjonalnie): ${fmtPLN(materialCostOrder)}  (wykorzystanie: ${(materialUsage * 100).toFixed(1)}%)`, 14, y + 16);
+    doc.text(`Czas+energia: ${fmtPLN(orderCosts.total)}`, 14, y + 21);
+    doc.text(`Szac. czas: ${timeAndEnergyTotals.minutes.toFixed(0)} min`, 14, y + 26);
+
+    doc.setFontSize(8);
+    doc.text("Wycena orientacyjna. Termin realizacji do ustalenia.", 14, y + 34);
+
+    doc.save(`${id}-wycena.pdf`);
+  }
+
   // ------------------------- UI -------------------------
 
   return (
@@ -417,15 +499,9 @@ export default function App() {
             </p>
           </div>
 
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 cursor-pointer">
-              <input
-                type="file"
-                accept="image/svg+xml"
-                multiple
-                className="hidden"
-                onChange={(e) => onAddSvg(e.target.files)}
-              />
+              <input type="file" accept="image/svg+xml" multiple className="hidden" onChange={(e) => onAddSvg(e.target.files)} />
               <span className="text-sm font-medium">Wgraj SVG</span>
             </label>
 
@@ -433,9 +509,15 @@ export default function App() {
               className="px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 text-sm font-medium disabled:opacity-50"
               disabled={!nesting.ok}
               onClick={exportLayoutSvg}
-              title={!nesting.ok ? "Najpierw dopasuj tak, aby zmiescilo sie na arkuszu" : "Eksport SVG do LightBurn"}
             >
-              Eksport ulozenia
+              Eksport ulozenia (SVG)
+            </button>
+
+            <button
+              className="px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 text-sm font-medium"
+              onClick={exportPdfClient}
+            >
+              PDF dla klienta
             </button>
           </div>
         </div>
@@ -457,7 +539,7 @@ export default function App() {
                 <NumberInput value={kerf} onChange={setKerf} min={0} step={0.01} />
               </Row>
 
-              <Row label="Materiał">
+              <Row label="Material">
                 <select
                   className="w-full px-3 py-2 rounded-xl border border-zinc-200 bg-white text-sm"
                   value={materialId}
@@ -488,7 +570,7 @@ export default function App() {
             </Card>
 
             <Card title="Koszty (PLN)">
-              <Row label="Cena arkusza (dla wybranego materiału)">
+              <Row label="Cena arkusza (dla wybranego materialu)">
                 <NumberInput value={sheetCost} onChange={setSheetCostForSelected} min={0} step={0.1} />
               </Row>
 
@@ -502,7 +584,7 @@ export default function App() {
                 <NumberInput value={laborPerHour} onChange={setLaborPerHour} min={0} step={0.1} />
               </Row>
 
-              <Row label="Marża (%)">
+              <Row label="Marza (%)">
                 <NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} />
               </Row>
               <Row label="Minimalna cena (PLN)">
@@ -523,10 +605,6 @@ export default function App() {
               <Row label="Czas na sztuke (min) (domyslnie)">
                 <NumberInput value={baseMinutesPerItem} onChange={setBaseMinutesPerItem} min={0} step={0.5} />
               </Row>
-              <p className="text-xs text-zinc-600 mt-2">
-                Jesli chcesz wiecej dokladnosci: w kolejnym kroku dodamy wyliczanie czasu z dlugosci sciezek (SVG/DXF)
-                oraz predkosci cięcia z profilu LightBurn.
-              </p>
             </Card>
           </div>
 
@@ -537,8 +615,8 @@ export default function App() {
                 <div className="text-sm text-zinc-700">
                   {nesting.ok ? (
                     <span>
-                      Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m²</b> • Arkusz:{" "}
-                      <b>{(sheetArea / 1e6).toFixed(3)} m²</b>
+                      Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m2</b> • Arkusz:{" "}
+                      <b>{(sheetArea / 1e6).toFixed(3)} m2</b>
                     </span>
                   ) : (
                     <span className="text-rose-700">Nie miesci sie na arkuszu — zmniejsz skale/ilosci lub zwieksz arkusz.</span>
@@ -555,14 +633,10 @@ export default function App() {
               </div>
 
               <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
-                <Stat label="Energia" value={`${orderCosts.energy.toFixed(2)} PLN`} />
-                <Stat label="Amortyzacja" value={`${orderCosts.depr.toFixed(2)} PLN`} />
-                <Stat label="Robocizna" value={`${orderCosts.labor.toFixed(2)} PLN`} />
+                <Stat label="Material (proporcjonalnie)" value={`${materialCostOrder.toFixed(2)} PLN`} />
                 <Stat label="Razem (czas+energia)" value={`${orderCosts.total.toFixed(2)} PLN`} />
-              </div>
-
-              <div className="mt-3">
-                <Stat label="Cena końcowa zamówienia" value={`${finalPrice.toFixed(2)} PLN`} />
+                <Stat label="Koszt produkcji" value={`${productionCost.toFixed(2)} PLN`} />
+                <Stat label="Cena koncowa" value={`${finalPrice.toFixed(2)} PLN`} />
               </div>
             </Card>
 
@@ -582,7 +656,7 @@ export default function App() {
                           <div>
                             <div className="font-medium">{d.name}</div>
                             <div className="text-xs text-zinc-600 tabular-nums">
-                              Rozmiar: {w.toFixed(1)} × {h.toFixed(1)} • baza: {d.baseW.toFixed(1)} × {d.baseH.toFixed(1)}
+                              Rozmiar: {w.toFixed(1)} x {h.toFixed(1)} • baza: {d.baseW.toFixed(1)} x {d.baseH.toFixed(1)}
                             </div>
                           </div>
                           <button
@@ -666,9 +740,7 @@ export default function App() {
         </div>
 
         <div className="mt-8 text-xs text-zinc-500">
-          <p>
-            Roadmap: (1) DXF import, (2) liczenie dlugosci sciezek, (3) PDF wewnetrzny, (4) lepszy nesting.
-          </p>
+          <p>Roadmap: (1) DXF import, (2) liczenie dlugosci sciezek, (3) PDF z fontem PL, (4) lepszy nesting.</p>
         </div>
       </div>
     </div>
