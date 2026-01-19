@@ -149,7 +149,7 @@ type MaterialProfile = {
 };
 
 const MATERIALS_DEFAULT: MaterialProfile[] = [
-  { id: "plywood_3", name: "Sklejka 3 mm", sheetCost: 10 },
+  { id: "plywood_3", name: "Sklejka 3 mm", sheetCost: 20 },
   { id: "hdf_3", name: "HDF 3 mm", sheetCost: 10 },
 ];
 
@@ -157,10 +157,10 @@ const MATERIALS_DEFAULT: MaterialProfile[] = [
 
 export default function App() {
   // Arkusz
-  const [sheetW, setSheetW] = useState(600); // mm
-  const [sheetH, setSheetH] = useState(400); // mm
+  const [sheetW, setSheetW] = useState(762); // mm
+  const [sheetH, setSheetH] = useState(762); // mm
   const [kerf, setKerf] = useState(0.15); // mm
-  const [padding, setPadding] = useState(2); // mm
+  const [padding, setPadding] = useState(1); // mm
 
   // Materialy
   const [materials, setMaterials] = useState<MaterialProfile[]>(MATERIALS_DEFAULT);
@@ -179,17 +179,17 @@ export default function App() {
   };
 
   // Koszty
-  const [powerPrice, setPowerPrice] = useState(1.2); // PLN / kWh
-  const [deprPerHour, setDeprPerHour] = useState(12); // PLN / h
-  const [laborPerHour, setLaborPerHour] = useState(45); // PLN / h
+  const [powerPrice, setPowerPrice] = useState(1.1); // PLN / kWh
+  const [deprPerHour, setDeprPerHour] = useState(1.2); // PLN / h
+  const [laborPerHour, setLaborPerHour] = useState(31); // PLN / h
 
   // Cena sprzedazy
-  const [marginPercent, setMarginPercent] = useState(10); // %
+  const [marginPercent, setMarginPercent] = useState(30); // %
   const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
 
   // Maszyna (uproczony model czasu/energii)
-  const [laserWatt, setLaserWatt] = useState(60); // W
-  const [assistWatt, setAssistWatt] = useState(20); // W
+  const [laserWatt, setLaserWatt] = useState(200); // W
+  const [assistWatt, setAssistWatt] = useState(1000); // W
   const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt
   const [setupMinutes, setSetupMinutes] = useState(6); // min / zamowienie
 
