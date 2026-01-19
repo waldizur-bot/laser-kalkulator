@@ -7,9 +7,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - prostego nestingu (heurystyka: shelf/row packing) na arkuszu
  * - wyliczania ceny kazdego projektu osobno (material + energia + amortyzacja + robocizna)
  * - eksportu ulozenia do SVG (do ponownego otwarcia w LightBurn)
- *
- * Uwaga: To jest MVP. Prawdziwy nesting (z obrotami, dowolnymi ksztaltami, marginesami od sciezek)
- * wymaga bardziej zaawansowanego algorytmu (np. no-fit polygon). Tutaj jest stabilny start.
  */
 
 // ------------------------- Helpers -------------------------
@@ -55,7 +52,6 @@ function makeId() {
 }
 
 // Prosty shelf packing: sortuj malejaco po wysokosci, ukladaj w rzedach.
-// Zwraca pozycje (x,y) dla kazdego prostokata.
 function shelfPack(
   items: { id: string; w: number; h: number; pad: number }[],
   binW: number,
@@ -75,7 +71,6 @@ function shelfPack(
     if (W > binW || H > binH) return { ok: false, placed: {} };
 
     if (cursorX + W > binW) {
-      // nowy rzad
       cursorX = 0;
       cursorY += rowH;
       rowH = 0;
@@ -109,11 +104,10 @@ type Design = {
   id: string;
   name: string;
   svgText: string;
-  baseW: number; // jednostki z SVG (zwykle px), przyjmujemy jako mm po imporcie (konfigurowalne przez scale)
+  baseW: number;
   baseH: number;
-  scale: number; // 1.0 = baza
+  scale: number;
   qty: number;
-  // szacunek czasu w minutach (opcjonalnie) — jesli brak, liczymy z "czas na sztuke" globalnie
   minutesOverride?: number;
 };
 
@@ -127,26 +121,56 @@ type Placed = {
   y: number;
 };
 
+type MaterialProfile = {
+  id: string;
+  name: string;
+  sheetCost: number;
+};
+
+const MATERIALS_DEFAULT: MaterialProfile[] = [
+  { id: "plywood_3", name: "Sklejka 3 mm", sheetCost: 10 },
+  { id: "hdf_3", name: "HDF 3 mm", sheetCost: 10 },
+];
+
 // ------------------------- App -------------------------
 
 export default function App() {
   // Arkusz
   const [sheetW, setSheetW] = useState(600); // mm
   const [sheetH, setSheetH] = useState(400); // mm
-  const [kerf, setKerf] = useState(0.15); // mm (informacyjnie / przyszlosciowo)
-  const [padding, setPadding] = useState(2); // mm odstep miedzy projektami
+  const [kerf, setKerf] = useState(0.15); // mm
+  const [padding, setPadding] = useState(2); // mm
+
+  // Materiały (profile w stanie, żeby dało się edytować cenę arkusza)
+  const [materials, setMaterials] = useState<MaterialProfile[]>(MATERIALS_DEFAULT);
+  const [materialId, setMaterialId] = useState<string>(MATERIALS_DEFAULT[0].id);
+
+  const selectedMaterial = useMemo(() => {
+    return materials.find((m) => m.id === materialId) ?? materials[0];
+  }, [materials, materialId]);
+
+  const sheetCost = selectedMaterial.sheetCost; // PLN / arkusz
+
+  const setSheetCostForSelected = (v: number) => {
+    setMaterials((prev) =>
+      prev.map((m) => (m.id === materialId ? { ...m, sheetCost: v } : m))
+    );
+  };
 
   // Koszty
-  const [sheetCost, setSheetCost] = useState(18); // PLN / arkusz
   const [powerPrice, setPowerPrice] = useState(1.2); // PLN / kWh
   const [deprPerHour, setDeprPerHour] = useState(12); // PLN / h
   const [laborPerHour, setLaborPerHour] = useState(45); // PLN / h
 
+  // Cena sprzedaży
+  const [marginPercent, setMarginPercent] = useState(10); // %
+  const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
+
   // Maszyna (uproczony model czasu/energii)
   const [laserWatt, setLaserWatt] = useState(60); // W
-  const [assistWatt, setAssistWatt] = useState(20); // W (np. wyciag/air assist — uproszczenie)
-  const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt (jesli nie podasz override)
-  const [setupMinutes, setSetupMinutes] = useState(6); // min na uruchomienie, mocowanie, itp. (dzielone na zamowienie)
+  const [assistWatt, setAssistWatt] = useState(20); // W
+  const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt
+  const [setupMinutes, setSetupMinutes] = useState(6); // min / zamówienie
 
   // Projekty
   const [designs, setDesigns] = useState<Design[]>([]);
@@ -189,7 +213,6 @@ export default function App() {
     const ctx = c.getContext("2d");
     if (!ctx) return;
 
-    // dopasuj skale widoku
     const maxW = 1000;
     const maxH = 520;
     const s = Math.min(maxW / sheetW, maxH / sheetH) * viewScale;
@@ -199,11 +222,9 @@ export default function App() {
 
     ctx.clearRect(0, 0, c.width, c.height);
 
-    // ramka arkusza
     ctx.lineWidth = 2;
     ctx.strokeRect(1, 1, c.width - 2, c.height - 2);
 
-    // siatka co 50mm
     ctx.globalAlpha = 0.25;
     ctx.lineWidth = 1;
     for (let x = 50; x < sheetW; x += 50) {
@@ -226,7 +247,6 @@ export default function App() {
       return;
     }
 
-    // prostokaty instancji
     ctx.lineWidth = 2;
     ctx.font = "12px sans-serif";
 
@@ -243,19 +263,17 @@ export default function App() {
   // ------------------------- Koszty -------------------------
 
   const totalArea = useMemo(() => {
-    // Pole zajete przez bounding boxy (nie realny odpad)
     return instances.reduce((acc, it) => acc + it.w * it.h, 0); // mm2
   }, [instances]);
 
   const sheetArea = sheetW * sheetH; // mm2
+
   const materialShare = useMemo(() => {
     if (!nesting.ok || instances.length === 0) return 0;
-    // Udzial materialu liczony proporcjonalnie do pola bbox
-    return sheetCost / Math.max(1e-9, sheetArea);
-  }, [nesting.ok, instances.length, sheetCost, sheetArea]); // PLN / mm2
+    return sheetCost / Math.max(1e-9, sheetArea); // PLN / mm2
+  }, [nesting.ok, instances.length, sheetCost, sheetArea]);
 
   const timeAndEnergyTotals = useMemo(() => {
-    // Czas: suma minut z override albo bazowych + setup
     let minutes = setupMinutes;
     for (const it of instances) {
       const d = designs.find((x) => x.id === it.designId);
@@ -264,8 +282,6 @@ export default function App() {
     }
 
     const hours = minutes / 60;
-
-    // Energia: (laserWatt + assistWatt) * czas
     const kwh = ((laserWatt + assistWatt) / 1000) * hours;
 
     return { minutes, hours, kwh };
@@ -275,16 +291,25 @@ export default function App() {
     const energy = timeAndEnergyTotals.kwh * powerPrice;
     const depr = timeAndEnergyTotals.hours * deprPerHour;
     const labor = timeAndEnergyTotals.hours * laborPerHour;
+
+    // total = koszty czasu i energii (jak było wcześniej)
     return { energy, depr, labor, total: energy + depr + labor };
   }, [timeAndEnergyTotals, powerPrice, deprPerHour, laborPerHour]);
 
+  // NOWE: cena końcowa zamówienia (koszt produkcji + marża, min. cena)
+  const finalPrice = useMemo(() => {
+    // tu możesz w przyszłości dodać też narzut materiału/odpadu albo stałą opłatę
+    const productionCost = orderCosts.total; // aktualnie: energia+amortyzacja+robocizna (materiał jest rozbijany per sztuka)
+    const withMargin = productionCost * (1 + marginPercent / 100);
+    return Math.max(withMargin, minOrderPrice);
+  }, [orderCosts.total, marginPercent, minOrderPrice]);
+
   const perItemPrice = useMemo(() => {
-    // Cena per instancja: material proporcjonalny do pola bbox + podzial kosztow czasu
-    // Koszty czasu dzielimy proporcjonalnie do "minut" (override lub base)
     if (instances.length === 0) return new Map<string, number>();
 
     const minutesByInstance = new Map<string, number>();
     let sumM = 0;
+
     for (const it of instances) {
       const d = designs.find((x) => x.id === it.designId);
       const m = d?.minutesOverride ?? baseMinutesPerItem;
@@ -292,7 +317,7 @@ export default function App() {
       sumM += m;
     }
 
-    const timeCostPool = orderCosts.total; // energy+depr+labor
+    const timeCostPool = orderCosts.total; // energia + depr + labor
 
     const out = new Map<string, number>();
     for (const it of instances) {
@@ -301,11 +326,11 @@ export default function App() {
       const timePart = sumM > 0 ? (m / sumM) * timeCostPool : timeCostPool / instances.length;
       out.set(it.instanceId, mat + timePart);
     }
+
     return out;
   }, [instances, designs, baseMinutesPerItem, materialShare, orderCosts.total]);
 
   const groupedPrices = useMemo(() => {
-    // Cena "projektu" (design) osobno: srednia cena instancji w grupie
     const byDesign = new Map<string, { name: string; count: number; sum: number }>();
     for (const it of instances) {
       const price = perItemPrice.get(it.instanceId) ?? 0;
@@ -357,31 +382,22 @@ export default function App() {
   function exportLayoutSvg() {
     if (!nesting.ok) return;
 
-    // Minimalny eksport: prostokaty bbox + osadzone svgi jako <g> z transform.
-    // W praktyce: LightBurn czesto akceptuje proste SVG z grupami.
-    // Uwaga: tu zakladamy, ze jednostki SVG == mm (to moze wymagac dopracowania w Twoim workflow).
-
     const header = `<?xml version="1.0" encoding="UTF-8"?>\n`;
-    const svgOpen = `<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"${sheetW}mm\" height=\"${sheetH}mm\" viewBox=\"0 0 ${sheetW} ${sheetH}\">\n`;
+    const svgOpen = `<svg xmlns="http://www.w3.org/2000/svg" width="${sheetW}mm" height="${sheetH}mm" viewBox="0 0 ${sheetW} ${sheetH}">\n`;
     const svgClose = `</svg>\n`;
 
     const body: string[] = [];
-    body.push(`<rect x=\"0\" y=\"0\" width=\"${sheetW}\" height=\"${sheetH}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.2\"/>`);
+    body.push(`<rect x="0" y="0" width="${sheetW}" height="${sheetH}" fill="none" stroke="black" stroke-width="0.2"/>`);
 
-    // Wstaw kazda instancje jako <g> z translate+scale i wklej zawartosc SVG bez zewnetrznego <svg>
     for (const p of nesting.placed) {
       const d = designs.find((x) => x.id === p.designId);
       if (!d) continue;
 
-      // Wytnij wewnetrzny content z SVG
       const inner = d.svgText
         .replace(/^[\s\S]*?<svg[^>]*>/i, "")
         .replace(/<\/svg>[\s\S]*$/i, "");
 
-      // Skala: d.scale, Pozycja: p.x,p.y
-      body.push(
-        `<g transform=\"translate(${p.x} ${p.y}) scale(${d.scale})\">${inner}</g>`
-      );
+      body.push(`<g transform="translate(${p.x} ${p.y}) scale(${d.scale})">${inner}</g>`);
     }
 
     const out = header + svgOpen + body.join("\n") + "\n" + svgClose;
@@ -440,6 +456,21 @@ export default function App() {
               <Row label="Kerf (mm) (informacyjnie)">
                 <NumberInput value={kerf} onChange={setKerf} min={0} step={0.01} />
               </Row>
+
+              <Row label="Materiał">
+                <select
+                  className="w-full px-3 py-2 rounded-xl border border-zinc-200 bg-white text-sm"
+                  value={materialId}
+                  onChange={(e) => setMaterialId(e.target.value)}
+                >
+                  {materials.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                    </option>
+                  ))}
+                </select>
+              </Row>
+
               <Row label="Zoom podgladu">
                 <div className="flex items-center gap-2">
                   <input
@@ -457,9 +488,10 @@ export default function App() {
             </Card>
 
             <Card title="Koszty (PLN)">
-              <Row label="Cena arkusza">
-                <NumberInput value={sheetCost} onChange={setSheetCost} min={0} step={0.1} />
+              <Row label="Cena arkusza (dla wybranego materiału)">
+                <NumberInput value={sheetCost} onChange={setSheetCostForSelected} min={0} step={0.1} />
               </Row>
+
               <Row label="Cena pradu (PLN/kWh)">
                 <NumberInput value={powerPrice} onChange={setPowerPrice} min={0} step={0.01} />
               </Row>
@@ -468,6 +500,13 @@ export default function App() {
               </Row>
               <Row label="Godzina pracy (PLN/h)">
                 <NumberInput value={laborPerHour} onChange={setLaborPerHour} min={0} step={0.1} />
+              </Row>
+
+              <Row label="Marża (%)">
+                <NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} />
+              </Row>
+              <Row label="Minimalna cena (PLN)">
+                <NumberInput value={minOrderPrice} onChange={setMinOrderPrice} min={0} step={1} />
               </Row>
             </Card>
 
@@ -485,8 +524,8 @@ export default function App() {
                 <NumberInput value={baseMinutesPerItem} onChange={setBaseMinutesPerItem} min={0} step={0.5} />
               </Row>
               <p className="text-xs text-zinc-600 mt-2">
-                Jesli chcesz wiecej dokladnosci: w kolejnym kroku dodamy wyliczanie czasu z dlugosci sciezek (z SVG/DXF)
-                oraz predkosci cięcia/jałowego przejazdu z profilu LightBurn.
+                Jesli chcesz wiecej dokladnosci: w kolejnym kroku dodamy wyliczanie czasu z dlugosci sciezek (SVG/DXF)
+                oraz predkosci cięcia z profilu LightBurn.
               </p>
             </Card>
           </div>
@@ -498,17 +537,16 @@ export default function App() {
                 <div className="text-sm text-zinc-700">
                   {nesting.ok ? (
                     <span>
-                      Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m²</b> •
-                      Arkusz: <b>{(sheetArea / 1e6).toFixed(3)} m²</b>
+                      Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m²</b> • Arkusz:{" "}
+                      <b>{(sheetArea / 1e6).toFixed(3)} m²</b>
                     </span>
                   ) : (
-                    <span className="text-rose-700">
-                      Nie miesci sie na arkuszu — zmniejsz skale/ilosci lub zwieksz arkusz.
-                    </span>
+                    <span className="text-rose-700">Nie miesci sie na arkuszu — zmniejsz skale/ilosci lub zwieksz arkusz.</span>
                   )}
                 </div>
                 <div className="text-sm text-zinc-700 tabular-nums">
-                  Szac. czas: <b>{timeAndEnergyTotals.minutes.toFixed(0)} min</b> • Energia: <b>{timeAndEnergyTotals.kwh.toFixed(2)} kWh</b>
+                  Szac. czas: <b>{timeAndEnergyTotals.minutes.toFixed(0)} min</b> • Energia:{" "}
+                  <b>{timeAndEnergyTotals.kwh.toFixed(2)} kWh</b>
                 </div>
               </div>
 
@@ -522,10 +560,10 @@ export default function App() {
                 <Stat label="Robocizna" value={`${orderCosts.labor.toFixed(2)} PLN`} />
                 <Stat label="Razem (czas+energia)" value={`${orderCosts.total.toFixed(2)} PLN`} />
               </div>
-              <p className="text-xs text-zinc-600 mt-2">
-                Material jest rozbijany proporcjonalnie do pola prostokata otaczajacego (bbox). To MVP. Docelowo mozemy liczyc pole
-                rzeczywiste (po poligonach) oraz doliczyc odpad i marginesy.
-              </p>
+
+              <div className="mt-3">
+                <Stat label="Cena końcowa zamówienia" value={`${finalPrice.toFixed(2)} PLN`} />
+              </div>
             </Card>
 
             <Card title="Projekty (skala, ilosc, czas)">
@@ -544,7 +582,7 @@ export default function App() {
                           <div>
                             <div className="font-medium">{d.name}</div>
                             <div className="text-xs text-zinc-600 tabular-nums">
-                              Rozmiar: {w.toFixed(1)} × {h.toFixed(1)} (jednostki importu) • baza: {d.baseW.toFixed(1)} × {d.baseH.toFixed(1)}
+                              Rozmiar: {w.toFixed(1)} × {h.toFixed(1)} • baza: {d.baseW.toFixed(1)} × {d.baseH.toFixed(1)}
                             </div>
                           </div>
                           <button
@@ -572,7 +610,12 @@ export default function App() {
                           </Labeled>
 
                           <Labeled label="Ilosc">
-                            <NumberInput value={d.qty} onChange={(v) => updateDesign(d.id, { qty: Math.max(1, Math.floor(v)) })} min={1} step={1} />
+                            <NumberInput
+                              value={d.qty}
+                              onChange={(v) => updateDesign(d.id, { qty: Math.max(1, Math.floor(v)) })}
+                              min={1}
+                              step={1}
+                            />
                           </Labeled>
 
                           <Labeled label="Czas / szt (min) (opcjonalnie)">
@@ -618,18 +661,13 @@ export default function App() {
                   </table>
                 </div>
               )}
-              <p className="text-xs text-zinc-600 mt-2">
-                Algorytm dzieli koszty czasu (energia+amortyzacja+robocizna) proporcjonalnie do minut na sztuke. Material dzielony jest
-                proporcjonalnie do pola bbox. Jesli chcesz, dodamy narzut (marza/odpad/minimalna kwota) i koszt pakowania/wysylki.
-              </p>
             </Card>
           </div>
         </div>
 
         <div className="mt-8 text-xs text-zinc-500">
           <p>
-            Roadmap: (1) rotacje 90° i lepsze sortowanie, (2) nesting po poligonach (no-fit), (3) odczyt dlugosci sciezek z SVG/DXF,
-            (4) profile materialow (sklejka 3/4/6mm) i presety LightBurn, (5) konta klientow + eksport PDF oferty.
+            Roadmap: (1) DXF import, (2) liczenie dlugosci sciezek, (3) PDF wewnetrzny, (4) lepszy nesting.
           </p>
         </div>
       </div>
