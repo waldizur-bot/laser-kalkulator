@@ -3,13 +3,11 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 
 /**
- * Prototyp webowej aplikacji do:
- * - wgrywania plikow SVG (np. eksport z LightBurn)
- * - skalowania i ustawiania ilosci projektow
- * - prostego nestingu (heurystyka: shelf/row packing) na arkuszu
- * - wyliczania ceny kazdego projektu osobno (material + energia + amortyzacja + robocizna)
- * - eksportu ulozenia do SVG (do ponownego otwarcia w LightBurn)
- * - eksportu PDF dla klienta z wycena
+ * - import SVG
+ * - nesting (shelf packing)
+ * - wycena: material (proporcjonalnie do wykorzystania arkusza) + czas/energia
+ * - dodatki: dostawa (gabaryt), opakowanie, Allegro%, podatek 8.5%, VAT wg wzoru
+ * - PDF dla klienta
  */
 
 // ------------------------- Helpers -------------------------
@@ -17,12 +15,9 @@ import autoTable from "jspdf-autotable";
 function mmToPx(mm: number, scale: number) {
   return mm * scale;
 }
-
 function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n));
 }
-
-// Bardzo uproszczony odczyt rozmiaru SVG: viewBox > width/height.
 function parseSvgSize(svgText: string): { w: number; h: number } {
   const parser = new DOMParser();
   const doc = parser.parseFromString(svgText, "image/svg+xml");
@@ -49,12 +44,9 @@ function parseSvgSize(svgText: string): { w: number; h: number } {
 
   return { w: 100, h: 100 };
 }
-
 function makeId() {
   return Math.random().toString(36).slice(2, 9);
 }
-
-// Prosty shelf packing: sortuj malejaco po wysokosci, ukladaj w rzedach.
 function shelfPack(
   items: { id: string; w: number; h: number; pad: number }[],
   binW: number,
@@ -88,7 +80,6 @@ function shelfPack(
 
   return { ok: true, placed };
 }
-
 function downloadText(filename: string, text: string) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -100,11 +91,9 @@ function downloadText(filename: string, text: string) {
   a.remove();
   URL.revokeObjectURL(url);
 }
-
 function fmtPLN(n: number) {
   return `${n.toFixed(2)} PLN`;
 }
-
 function nowStamp() {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -153,6 +142,10 @@ const MATERIALS_DEFAULT: MaterialProfile[] = [
   { id: "hdf_3", name: "HDF 3 mm", sheetCost: 10 },
 ];
 
+type ShippingSize = "NONE" | "A" | "B" | "C";
+const VAT_RATE = 0.23;
+const TAX_85 = 0.085;
+
 // ------------------------- App -------------------------
 
 export default function App() {
@@ -171,19 +164,18 @@ export default function App() {
   }, [materials, materialId]);
 
   const sheetCost = selectedMaterial.sheetCost; // PLN / arkusz
-
   const setSheetCostForSelected = (v: number) => {
     setMaterials((prev) =>
       prev.map((m) => (m.id === materialId ? { ...m, sheetCost: v } : m))
     );
   };
 
-  // Koszty
+  // Koszty (produkcyjne)
   const [powerPrice, setPowerPrice] = useState(1.1); // PLN / kWh
   const [deprPerHour, setDeprPerHour] = useState(1.2); // PLN / h
   const [laborPerHour, setLaborPerHour] = useState(31); // PLN / h
 
-  // Cena sprzedazy
+  // Cena sprzedazy (marża na produkcji; dostawa+opak doliczane osobno)
   const [marginPercent, setMarginPercent] = useState(250); // %
   const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
 
@@ -193,6 +185,22 @@ export default function App() {
   const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt
   const [setupMinutes, setSetupMinutes] = useState(6); // min / zamowienie
 
+  // Dodatki: dostawa / opakowanie / Allegro
+  const [shippingSize, setShippingSize] = useState<ShippingSize>("NONE");
+  const [shippingPriceA, setShippingPriceA] = useState(16.99);
+  const [shippingPriceB, setShippingPriceB] = useState(19.99);
+  const [shippingPriceC, setShippingPriceC] = useState(24.99);
+
+  const [packagingCost, setPackagingCost] = useState(0); // PLN
+  const [allegroFeePercent, setAllegroFeePercent] = useState(0); // %
+
+  const shippingCost = useMemo(() => {
+    if (shippingSize === "A") return Math.max(0, shippingPriceA);
+    if (shippingSize === "B") return Math.max(0, shippingPriceB);
+    if (shippingSize === "C") return Math.max(0, shippingPriceC);
+    return 0;
+  }, [shippingSize, shippingPriceA, shippingPriceB, shippingPriceC]);
+
   // Projekty
   const [designs, setDesigns] = useState<Design[]>([]);
 
@@ -200,7 +208,7 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [viewScale, setViewScale] = useState(1.0);
 
-  // Zbuduj liste instancji do nestingu
+  // Instancje do nestingu
   const instances = useMemo(() => {
     const out: { instanceId: string; designId: string; name: string; w: number; h: number }[] = [];
     for (const d of designs) {
@@ -227,7 +235,7 @@ export default function App() {
     return { ok: true as const, placed };
   }, [instances, padding, sheetW, sheetH]);
 
-  // Rysuj arkusz i polozenia
+  // Draw preview
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
@@ -242,7 +250,6 @@ export default function App() {
     c.height = Math.floor(sheetH * s);
 
     ctx.clearRect(0, 0, c.width, c.height);
-
     ctx.lineWidth = 2;
     ctx.strokeRect(1, 1, c.width - 2, c.height - 2);
 
@@ -270,7 +277,6 @@ export default function App() {
 
     ctx.lineWidth = 2;
     ctx.font = "12px sans-serif";
-
     nesting.placed.forEach((p) => {
       const x = mmToPx(p.x, s);
       const y = mmToPx(p.y, s);
@@ -283,28 +289,30 @@ export default function App() {
 
   // ------------------------- Koszty -------------------------
 
-  const totalArea = useMemo(() => {
-    return instances.reduce((acc, it) => acc + it.w * it.h, 0); // mm2
-  }, [instances]);
-
+  const totalArea = useMemo(() => instances.reduce((acc, it) => acc + it.w * it.h, 0), [instances]); // mm2
   const sheetArea = sheetW * sheetH; // mm2
 
-  // PLN / mm2
-  const materialShare = useMemo(() => {
-    if (!nesting.ok || instances.length === 0) return 0;
-    return sheetCost / Math.max(1e-9, sheetArea);
-  }, [nesting.ok, instances.length, sheetCost, sheetArea]);
-
-  // NOWE: wykorzystanie arkusza i koszt materialu dla zamowienia
+  // wykorzystanie arkusza: (suma bbox) / (arkusz)
   const materialUsage = useMemo(() => {
     if (instances.length === 0) return 0;
     return clamp(totalArea / Math.max(1e-9, sheetArea), 0, 1);
   }, [instances.length, totalArea, sheetArea]);
 
-  const materialCostOrder = useMemo(() => {
-    return sheetCost * materialUsage; // PLN
-  }, [sheetCost, materialUsage]);
+  // koszt materiału zamówienia (proporcjonalnie)
+  const materialCostOrder = useMemo(() => sheetCost * materialUsage, [sheetCost, materialUsage]);
 
+  // rozbicie materiału na instancje po polu bbox
+  const materialCostByInstance = useMemo(() => {
+    const map = new Map<string, number>();
+    if (instances.length === 0) return map;
+    const total = Math.max(1e-9, totalArea);
+    for (const it of instances) {
+      map.set(it.instanceId, materialCostOrder * ((it.w * it.h) / total));
+    }
+    return map;
+  }, [instances, totalArea, materialCostOrder]);
+
+  // czas + energia
   const timeAndEnergyTotals = useMemo(() => {
     let minutes = setupMinutes;
     for (const it of instances) {
@@ -312,10 +320,8 @@ export default function App() {
       const m = d?.minutesOverride ?? baseMinutesPerItem;
       minutes += m;
     }
-
     const hours = minutes / 60;
     const kwh = ((laserWatt + assistWatt) / 1000) * hours;
-
     return { minutes, hours, kwh };
   }, [instances, designs, baseMinutesPerItem, setupMinutes, laserWatt, assistWatt]);
 
@@ -323,27 +329,62 @@ export default function App() {
     const energy = timeAndEnergyTotals.kwh * powerPrice;
     const depr = timeAndEnergyTotals.hours * deprPerHour;
     const labor = timeAndEnergyTotals.hours * laborPerHour;
-
     return { energy, depr, labor, total: energy + depr + labor };
   }, [timeAndEnergyTotals, powerPrice, deprPerHour, laborPerHour]);
 
-  // NOWE: koszt produkcji (czas+energia + material)
-  const productionCost = useMemo(() => {
-    return orderCosts.total + materialCostOrder;
-  }, [orderCosts.total, materialCostOrder]);
+  // koszt produkcji (materiał + czas/energia)
+  const productionCost = useMemo(() => orderCosts.total + materialCostOrder, [orderCosts.total, materialCostOrder]);
 
-  // NOWE: cena koncowa z marza i min cena
-  const finalPrice = useMemo(() => {
+  // cena samego produktu (bez dostawy i opakowania): koszt produkcji + marża
+  const productSellPrice = useMemo(() => {
     const withMargin = productionCost * (1 + marginPercent / 100);
-    return Math.max(withMargin, minOrderPrice);
-  }, [productionCost, marginPercent, minOrderPrice]);
+    return withMargin;
+  }, [productionCost, marginPercent]);
 
+  // cena końcowa dla klienta (z dostawą + opakowaniem)
+  const finalPrice = useMemo(() => {
+    const total = productSellPrice + shippingCost + Math.max(0, packagingCost);
+    return Math.max(total, minOrderPrice);
+  }, [productSellPrice, shippingCost, packagingCost, minOrderPrice]);
+
+  // opłata Allegro od ceny końcowej (z dostawą, opakowaniem itd.)
+  const allegroFee = useMemo(() => {
+    return finalPrice * (Math.max(0, allegroFeePercent) / 100);
+  }, [finalPrice, allegroFeePercent]);
+
+  // podatek 8.5% od ceny końcowej
+  const tax85 = useMemo(() => finalPrice * TAX_85, [finalPrice]);
+
+  // VAT wg Twojego wzoru (23%)
+  const vatCalc = useMemo(() => {
+    const vatFinal = finalPrice * VAT_RATE;
+    const vatAllegro = allegroFee * VAT_RATE;
+    const vatMaterial = materialCostOrder * VAT_RATE;
+    const vatPack = Math.max(0, packagingCost) * VAT_RATE;
+    return vatFinal - vatAllegro - vatMaterial - vatPack;
+  }, [finalPrice, allegroFee, materialCostOrder, packagingCost]);
+
+  // Zysk (odejmujemy realne koszty)
+  const profit = useMemo(() => {
+    return (
+      finalPrice -
+      materialCostOrder -
+      shippingCost -
+      Math.max(0, packagingCost) -
+      tax85 -
+      vatCalc -
+      orderCosts.energy -
+      orderCosts.labor -
+      orderCosts.depr
+    );
+  }, [finalPrice, materialCostOrder, shippingCost, packagingCost, tax85, vatCalc, orderCosts.energy, orderCosts.labor, orderCosts.depr]);
+
+  // per instancja: (materiał rozbity) + (czas/energia po minutach)
   const perItemPrice = useMemo(() => {
     if (instances.length === 0) return new Map<string, number>();
 
     const minutesByInstance = new Map<string, number>();
     let sumM = 0;
-
     for (const it of instances) {
       const d = designs.find((x) => x.id === it.designId);
       const m = d?.minutesOverride ?? baseMinutesPerItem;
@@ -351,18 +392,15 @@ export default function App() {
       sumM += m;
     }
 
-    const timeCostPool = orderCosts.total;
-
     const out = new Map<string, number>();
     for (const it of instances) {
-      const mat = it.w * it.h * materialShare;
+      const mat = materialCostByInstance.get(it.instanceId) ?? 0;
       const m = minutesByInstance.get(it.instanceId) ?? baseMinutesPerItem;
-      const timePart = sumM > 0 ? (m / sumM) * timeCostPool : timeCostPool / instances.length;
+      const timePart = sumM > 0 ? (m / sumM) * orderCosts.total : orderCosts.total / instances.length;
       out.set(it.instanceId, mat + timePart);
     }
-
     return out;
-  }, [instances, designs, baseMinutesPerItem, materialShare, orderCosts.total]);
+  }, [instances, designs, baseMinutesPerItem, materialCostByInstance, orderCosts.total]);
 
   const groupedPrices = useMemo(() => {
     const byDesign = new Map<string, { name: string; count: number; sum: number }>();
@@ -421,7 +459,9 @@ export default function App() {
     const svgClose = `</svg>\n`;
 
     const body: string[] = [];
-    body.push(`<rect x="0" y="0" width="${sheetW}" height="${sheetH}" fill="none" stroke="black" stroke-width="0.2"/>`);
+    body.push(
+      `<rect x="0" y="0" width="${sheetW}" height="${sheetH}" fill="none" stroke="black" stroke-width="0.2"/>`
+    );
 
     for (const p of nesting.placed) {
       const d = designs.find((x) => x.id === p.designId);
@@ -441,9 +481,13 @@ export default function App() {
   function exportPdfClient() {
     const { id, date, time } = nowStamp();
 
-    // Skalujemy pozycje tak, aby suma pozycji = finalPrice (z marza + min)
     const baseSum = groupedPrices.reduce((acc, r) => acc + r.total, 0);
-    const multiplier = baseSum > 0 ? finalPrice / baseSum : 1;
+
+    // Tabela pozycji ma sumować się do: finalPrice - dostawa - opakowanie
+    const extras = shippingCost + Math.max(0, packagingCost);
+    const targetItemsSum = Math.max(0, finalPrice - extras);
+
+    const multiplier = baseSum > 0 ? targetItemsSum / baseSum : 1;
 
     const rows = groupedPrices.map((r) => {
       const unit = r.unit * multiplier;
@@ -472,13 +516,12 @@ export default function App() {
 
     const y = (doc as any).lastAutoTable?.finalY ?? 46;
 
-    doc.setFontSize(11);
-    doc.text(`RAZEM: ${fmtPLN(finalPrice)}`, 14, y + 10);
+    doc.setFontSize(10);
+    if (shippingCost > 0) doc.text(`Dostawa (${shippingSize}): ${fmtPLN(shippingCost)}`, 14, y + 10);
+    if (Math.max(0, packagingCost) > 0) doc.text(`Opakowanie: ${fmtPLN(Math.max(0, packagingCost))}`, 14, y + 16);
 
-    doc.setFontSize(9);
-    doc.text(`Material (proporcjonalnie): ${fmtPLN(materialCostOrder)}  (wykorzystanie: ${(materialUsage * 100).toFixed(1)}%)`, 14, y + 16);
-    doc.text(`Czas+energia: ${fmtPLN(orderCosts.total)}`, 14, y + 21);
-    doc.text(`Szac. czas: ${timeAndEnergyTotals.minutes.toFixed(0)} min`, 14, y + 26);
+    doc.setFontSize(12);
+    doc.text(`RAZEM: ${fmtPLN(finalPrice)}`, 14, y + 26);
 
     doc.setFontSize(8);
     doc.text("Wycena orientacyjna. Termin realizacji do ustalenia.", 14, y + 34);
@@ -493,9 +536,9 @@ export default function App() {
       <div className="max-w-6xl mx-auto p-4 md:p-8">
         <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
           <div>
-            <h1 className="text-2xl md:text-3xl font-semibold">Kalkulator wyceny + nesting (CO2 / sklejka)</h1>
+            <h1 className="text-2xl md:text-3xl font-semibold">Kalkulator wyceny + nesting</h1>
             <p className="text-sm text-zinc-600 mt-1">
-              Importuj SVG, ustaw skale i ilosci, a aplikacja ulozy projekty na arkuszu i policzy cene kazdego projektu.
+              Importuj SVG, ustaw skale i ilosci, a aplikacja ulozy projekty na arkuszu i policzy wycene + dodatki.
             </p>
           </div>
 
@@ -523,21 +566,13 @@ export default function App() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-6">
-          {/* Left: settings */}
+          {/* Left */}
           <div className="lg:col-span-1 flex flex-col gap-4">
             <Card title="Parametry arkusza">
-              <Row label="Szerokosc arkusza (mm)">
-                <NumberInput value={sheetW} onChange={setSheetW} min={1} />
-              </Row>
-              <Row label="Wysokosc arkusza (mm)">
-                <NumberInput value={sheetH} onChange={setSheetH} min={1} />
-              </Row>
-              <Row label="Odstep miedzy projektami (mm)">
-                <NumberInput value={padding} onChange={setPadding} min={0} step={0.5} />
-              </Row>
-              <Row label="Kerf (mm) (informacyjnie)">
-                <NumberInput value={kerf} onChange={setKerf} min={0} step={0.01} />
-              </Row>
+              <Row label="Szerokosc arkusza (mm)"><NumberInput value={sheetW} onChange={setSheetW} min={1} /></Row>
+              <Row label="Wysokosc arkusza (mm)"><NumberInput value={sheetH} onChange={setSheetH} min={1} /></Row>
+              <Row label="Odstep miedzy projektami (mm)"><NumberInput value={padding} onChange={setPadding} min={0} step={0.5} /></Row>
+              <Row label="Kerf (mm) (info)"><NumberInput value={kerf} onChange={setKerf} min={0} step={0.01} /></Row>
 
               <Row label="Material">
                 <select
@@ -546,9 +581,7 @@ export default function App() {
                   onChange={(e) => setMaterialId(e.target.value)}
                 >
                   {materials.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name}
-                    </option>
+                    <option key={m.id} value={m.id}>{m.name}</option>
                   ))}
                 </select>
               </Row>
@@ -569,62 +602,66 @@ export default function App() {
               </Row>
             </Card>
 
-            <Card title="Koszty (PLN)">
-              <Row label="Cena arkusza (dla wybranego materialu)">
-                <NumberInput value={sheetCost} onChange={setSheetCostForSelected} min={0} step={0.1} />
+            <Card title="Koszty i cena">
+              <Row label="Cena arkusza (PLN)"><NumberInput value={sheetCost} onChange={setSheetCostForSelected} min={0} step={0.1} /></Row>
+
+              <Row label="Cena pradu (PLN/kWh)"><NumberInput value={powerPrice} onChange={setPowerPrice} min={0} step={0.01} /></Row>
+              <Row label="Amortyzacja (PLN/h)"><NumberInput value={deprPerHour} onChange={setDeprPerHour} min={0} step={0.1} /></Row>
+              <Row label="Godzina pracy (PLN/h)"><NumberInput value={laborPerHour} onChange={setLaborPerHour} min={0} step={0.1} /></Row>
+
+              <Row label="Marza (%)"><NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} /></Row>
+              <Row label="Minimalna cena (PLN)"><NumberInput value={minOrderPrice} onChange={setMinOrderPrice} min={0} step={1} /></Row>
+            </Card>
+
+            <Card title="Dostawa / opakowanie / Allegro / podatki">
+              <Row label="Gabaryt dostawy">
+                <Segment
+                  value={shippingSize}
+                  onChange={setShippingSize}
+                  options={[
+                    { value: "NONE", label: "Brak" },
+                    { value: "A", label: "A" },
+                    { value: "B", label: "B" },
+                    { value: "C", label: "C" },
+                  ]}
+                />
               </Row>
 
-              <Row label="Cena pradu (PLN/kWh)">
-                <NumberInput value={powerPrice} onChange={setPowerPrice} min={0} step={0.01} />
-              </Row>
-              <Row label="Amortyzacja (PLN/h)">
-                <NumberInput value={deprPerHour} onChange={setDeprPerHour} min={0} step={0.1} />
-              </Row>
-              <Row label="Godzina pracy (PLN/h)">
-                <NumberInput value={laborPerHour} onChange={setLaborPerHour} min={0} step={0.1} />
-              </Row>
+              <Row label="Koszt dostawy A (PLN)"><NumberInput value={shippingPriceA} onChange={setShippingPriceA} min={0} step={0.01} /></Row>
+              <Row label="Koszt dostawy B (PLN)"><NumberInput value={shippingPriceB} onChange={setShippingPriceB} min={0} step={0.01} /></Row>
+              <Row label="Koszt dostawy C (PLN)"><NumberInput value={shippingPriceC} onChange={setShippingPriceC} min={0} step={0.01} /></Row>
 
-              <Row label="Marza (%)">
-                <NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} />
-              </Row>
-              <Row label="Minimalna cena (PLN)">
-                <NumberInput value={minOrderPrice} onChange={setMinOrderPrice} min={0} step={1} />
-              </Row>
+              <Row label="Koszt opakowania (PLN)"><NumberInput value={packagingCost} onChange={setPackagingCost} min={0} step={0.01} /></Row>
+              <Row label="Oplata Allegro (%)"><NumberInput value={allegroFeePercent} onChange={setAllegroFeePercent} min={0} step={0.1} /></Row>
+
+              <div className="text-xs text-zinc-600 mt-2">
+                Podatek 8,5% liczony od ceny końcowej. VAT 23% wg wzoru: VAT(cena) - VAT(Allegro) - VAT(material) - VAT(opak).
+              </div>
             </Card>
 
             <Card title="Model czasu i energii (uproczony)">
-              <Row label="Laser (W)">
-                <NumberInput value={laserWatt} onChange={setLaserWatt} min={0} step={1} />
-              </Row>
-              <Row label="Dodatkowe odbiorniki (W)">
-                <NumberInput value={assistWatt} onChange={setAssistWatt} min={0} step={1} />
-              </Row>
-              <Row label="Setup na zamowienie (min)">
-                <NumberInput value={setupMinutes} onChange={setSetupMinutes} min={0} step={1} />
-              </Row>
-              <Row label="Czas na sztuke (min) (domyslnie)">
-                <NumberInput value={baseMinutesPerItem} onChange={setBaseMinutesPerItem} min={0} step={0.5} />
-              </Row>
+              <Row label="Laser (W)"><NumberInput value={laserWatt} onChange={setLaserWatt} min={0} step={1} /></Row>
+              <Row label="Dodatkowe odbiorniki (W)"><NumberInput value={assistWatt} onChange={setAssistWatt} min={0} step={1} /></Row>
+              <Row label="Setup (min)"><NumberInput value={setupMinutes} onChange={setSetupMinutes} min={0} step={1} /></Row>
+              <Row label="Czas / szt (min)"><NumberInput value={baseMinutesPerItem} onChange={setBaseMinutesPerItem} min={0} step={0.5} /></Row>
             </Card>
           </div>
 
-          {/* Middle: canvas */}
+          {/* Right */}
           <div className="lg:col-span-2 flex flex-col gap-4">
             <Card title="Ulozenie na arkuszu">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="text-sm text-zinc-700">
                   {nesting.ok ? (
                     <span>
-                      Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m2</b> • Arkusz:{" "}
-                      <b>{(sheetArea / 1e6).toFixed(3)} m2</b>
+                      Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m2</b> • Arkusz: <b>{(sheetArea / 1e6).toFixed(3)} m2</b>
                     </span>
                   ) : (
                     <span className="text-rose-700">Nie miesci sie na arkuszu — zmniejsz skale/ilosci lub zwieksz arkusz.</span>
                   )}
                 </div>
                 <div className="text-sm text-zinc-700 tabular-nums">
-                  Szac. czas: <b>{timeAndEnergyTotals.minutes.toFixed(0)} min</b> • Energia:{" "}
-                  <b>{timeAndEnergyTotals.kwh.toFixed(2)} kWh</b>
+                  Szac. czas: <b>{timeAndEnergyTotals.minutes.toFixed(0)} min</b> • Energia: <b>{timeAndEnergyTotals.kwh.toFixed(2)} kWh</b>
                 </div>
               </div>
 
@@ -633,18 +670,30 @@ export default function App() {
               </div>
 
               <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
-                <Stat label="Material (proporcjonalnie)" value={`${materialCostOrder.toFixed(2)} PLN`} />
-                <Stat label="Razem (czas+energia)" value={`${orderCosts.total.toFixed(2)} PLN`} />
-                <Stat label="Koszt produkcji" value={`${productionCost.toFixed(2)} PLN`} />
-                <Stat label="Cena koncowa" value={`${finalPrice.toFixed(2)} PLN`} />
+                <Stat label="Material (zamówienie)" value={fmtPLN(materialCostOrder)} />
+                <Stat label="Czas+energia (prod.)" value={fmtPLN(orderCosts.total)} />
+                <Stat label="Cena produktu (z marżą)" value={fmtPLN(productSellPrice)} />
+                <Stat label="Cena końcowa (klient)" value={fmtPLN(finalPrice)} />
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
+                <Stat label="Dostawa" value={fmtPLN(shippingCost)} />
+                <Stat label="Opakowanie" value={fmtPLN(Math.max(0, packagingCost))} />
+                <Stat label="Allegro fee" value={fmtPLN(allegroFee)} />
+                <Stat label="Podatek 8,5%" value={fmtPLN(tax85)} />
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
+                <Stat label="VAT (wg wzoru)" value={fmtPLN(vatCalc)} />
+                <Stat label="Zysk (po kosztach)" value={fmtPLN(profit)} />
+                <Stat label="Wykorzystanie arkusza" value={`${(materialUsage * 100).toFixed(1)}%`} />
+                <Stat label="Robocizna+prąd+amort" value={fmtPLN(orderCosts.energy + orderCosts.labor + orderCosts.depr)} />
               </div>
             </Card>
 
             <Card title="Projekty (skala, ilosc, czas)">
               {designs.length === 0 ? (
-                <div className="text-sm text-zinc-600">
-                  Wgraj jeden lub kilka plikow SVG (np. eksport z LightBurn). Najlepiej, gdy SVG ma poprawny viewBox.
-                </div>
+                <div className="text-sm text-zinc-600">Wgraj jeden lub kilka plikow SVG (np. eksport z LightBurn).</div>
               ) : (
                 <div className="flex flex-col gap-3">
                   {designs.map((d) => {
@@ -659,10 +708,7 @@ export default function App() {
                               Rozmiar: {w.toFixed(1)} x {h.toFixed(1)} • baza: {d.baseW.toFixed(1)} x {d.baseH.toFixed(1)}
                             </div>
                           </div>
-                          <button
-                            className="text-sm px-3 py-1.5 rounded-xl border border-zinc-200 hover:bg-zinc-50"
-                            onClick={() => removeDesign(d.id)}
-                          >
+                          <button className="text-sm px-3 py-1.5 rounded-xl border border-zinc-200 hover:bg-zinc-50" onClick={() => removeDesign(d.id)}>
                             Usun
                           </button>
                         </div>
@@ -684,12 +730,7 @@ export default function App() {
                           </Labeled>
 
                           <Labeled label="Ilosc">
-                            <NumberInput
-                              value={d.qty}
-                              onChange={(v) => updateDesign(d.id, { qty: Math.max(1, Math.floor(v)) })}
-                              min={1}
-                              step={1}
-                            />
+                            <NumberInput value={d.qty} onChange={(v) => updateDesign(d.id, { qty: Math.max(1, Math.floor(v)) })} min={1} step={1} />
                           </Labeled>
 
                           <Labeled label="Czas / szt (min) (opcjonalnie)">
@@ -708,7 +749,7 @@ export default function App() {
               )}
             </Card>
 
-            <Card title="Wycena per projekt">
+            <Card title="Wycena per projekt (produkcyjna)">
               {groupedPrices.length === 0 ? (
                 <div className="text-sm text-zinc-600">Dodaj projekty, aby zobaczyc wyceny.</div>
               ) : (
@@ -718,8 +759,8 @@ export default function App() {
                       <tr className="text-left text-zinc-600">
                         <th className="py-2">Projekt</th>
                         <th className="py-2">Ilosc</th>
-                        <th className="py-2">Cena / szt</th>
-                        <th className="py-2">Suma</th>
+                        <th className="py-2">Koszt/szt</th>
+                        <th className="py-2">Koszt suma</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -727,20 +768,19 @@ export default function App() {
                         <tr key={r.designId} className="border-t border-zinc-200">
                           <td className="py-2 font-medium">{r.name}</td>
                           <td className="py-2 tabular-nums">{r.qty}</td>
-                          <td className="py-2 tabular-nums">{r.unit.toFixed(2)} PLN</td>
-                          <td className="py-2 tabular-nums">{r.total.toFixed(2)} PLN</td>
+                          <td className="py-2 tabular-nums">{fmtPLN(r.unit)}</td>
+                          <td className="py-2 tabular-nums">{fmtPLN(r.total)}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
               )}
+              <p className="text-xs text-zinc-500 mt-2">
+                To jest koszt produkcyjny rozbity na projekty. Cena klienta wynika z marży + dostawy + opakowania, a koszty Allegro/podatków wpływają na zysk.
+              </p>
             </Card>
           </div>
-        </div>
-
-        <div className="mt-8 text-xs text-zinc-500">
-          <p>Roadmap: (1) DXF import, (2) liczenie dlugosci sciezek, (3) PDF z fontem PL, (4) lepszy nesting.</p>
         </div>
       </div>
     </div>
@@ -762,7 +802,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   return (
     <div className="flex items-center justify-between gap-3 py-1.5">
       <div className="text-sm text-zinc-700">{label}</div>
-      <div className="w-40">{children}</div>
+      <div className="w-44">{children}</div>
     </div>
   );
 }
@@ -807,6 +847,34 @@ function Stat({ label, value }: { label: string; value: string }) {
     <div className="rounded-2xl border border-zinc-200 bg-white p-3">
       <div className="text-xs text-zinc-600">{label}</div>
       <div className="text-base font-semibold tabular-nums mt-0.5">{value}</div>
+    </div>
+  );
+}
+
+function Segment<T extends string>({
+  value,
+  onChange,
+  options,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  options: { value: T; label: string }[];
+}) {
+  return (
+    <div className="inline-flex rounded-xl border border-zinc-200 overflow-hidden bg-white">
+      {options.map((opt) => {
+        const active = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            className={`px-3 py-2 text-sm ${active ? "bg-zinc-900 text-white" : "bg-white text-zinc-900"} border-r border-zinc-200 last:border-r-0`}
+            onClick={() => onChange(opt.value)}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
