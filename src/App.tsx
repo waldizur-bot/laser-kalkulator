@@ -3,31 +3,21 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 
 /**
- * Prototyp webowej aplikacji do:
- * - wgrywania plikow SVG (np. eksport z LightBurn)
- * - skalowania i ustawiania ilosci projektow
- * - prostego nestingu (heurystyka: shelf/row packing) na arkuszu
- * - wyliczania kosztow (material + energia + amortyzacja + robocizna)
- * - dodawania: dostawa (A/B/C/brak), opakowanie, prowizja Allegro (%), podatek 8.5%, VAT (wg wzoru)
- * - eksportu ulozenia do SVG (do ponownego otwarcia w LightBurn)
- * - eksportu PDF dla klienta z wycena
+ * - SVG import
+ * - nesting (shelf pack)
+ * - koszty: material proporcjonalnie + czas/energia
+ * - doliczanie: dostawa (A/B/C/brak), opakowanie, Allegro %, podatek 8.5%, VAT (wg wzoru)
+ * - PDF dla klienta
  */
 
-/* =========================
-   USTAWIENIA (stałe)
-   ========================= */
 const TAX_RATE = 0.085; // 8.5%
 const VAT_RATE = 0.23;  // 23%
 
-// VAT "z kwoty brutto" (jeśli traktujesz kwoty jako brutto)
 function vatFromGross(gross: number) {
-  // brutto = netto * 1.23 => VAT = brutto - brutto/1.23 = brutto * 23/123
+  // VAT z kwoty brutto (23/123)
   return gross * (VAT_RATE / (1 + VAT_RATE));
 }
 
-/* =========================
-   Helpers
-   ========================= */
 function mmToPx(mm: number, scale: number) {
   return mm * scale;
 }
@@ -132,9 +122,6 @@ function nowStamp() {
   };
 }
 
-/* =========================
-   Types
-   ========================= */
 type Design = {
   id: string;
   name: string;
@@ -159,7 +146,7 @@ type Placed = {
 type MaterialProfile = {
   id: string;
   name: string;
-  sheetCost: number; // PLN / arkusz
+  sheetCost: number;
 };
 
 const MATERIALS_DEFAULT: MaterialProfile[] = [
@@ -169,19 +156,17 @@ const MATERIALS_DEFAULT: MaterialProfile[] = [
 
 type ShippingSize = "none" | "A" | "B" | "C";
 
-/* =========================
-   App
-   ========================= */
 export default function App() {
   // Arkusz
-  const [sheetW, setSheetW] = useState(762); // mm
-  const [sheetH, setSheetH] = useState(762); // mm
-  const [kerf, setKerf] = useState(0.15); // mm (info)
-  const [padding, setPadding] = useState(1); // mm
+  const [sheetW, setSheetW] = useState(762);
+  const [sheetH, setSheetH] = useState(762);
+  const [kerf, setKerf] = useState(0.15);
+  const [padding, setPadding] = useState(1);
 
-  // Materialy
+  // Materiał
   const [materials, setMaterials] = useState<MaterialProfile[]>(MATERIALS_DEFAULT);
   const [materialId, setMaterialId] = useState<string>(MATERIALS_DEFAULT[0].id);
+
   const selectedMaterial = useMemo(() => materials.find((m) => m.id === materialId) ?? materials[0], [materials, materialId]);
   const sheetCost = selectedMaterial.sheetCost;
 
@@ -190,39 +175,37 @@ export default function App() {
   };
 
   // Koszty czasu/energii
-  const [powerPrice, setPowerPrice] = useState(1.1); // PLN / kWh
-  const [deprPerHour, setDeprPerHour] = useState(1.2); // PLN / h
-  const [laborPerHour, setLaborPerHour] = useState(31); // PLN / h
+  const [powerPrice, setPowerPrice] = useState(1.1);
+  const [deprPerHour, setDeprPerHour] = useState(1.2);
+  const [laborPerHour, setLaborPerHour] = useState(31);
 
-  // Cena (Twoja marża) – nakładana na KOSZT PRODUKCJI + (dostawa+opakowanie), bez Allegro/podatków (żeby nie robić pętli)
-  const [marginPercent, setMarginPercent] = useState(250); // %
-  const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
+  // Marża i min
+  const [marginPercent, setMarginPercent] = useState(250);
+  const [minOrderPrice, setMinOrderPrice] = useState(10);
 
-  // Maszyna (uproczony model czasu/energii)
-  const [laserWatt, setLaserWatt] = useState(200); // W
-  const [assistWatt, setAssistWatt] = useState(1000); // W
-  const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt
-  const [setupMinutes, setSetupMinutes] = useState(6); // min / zamowienie
+  // Model maszyny
+  const [laserWatt, setLaserWatt] = useState(200);
+  const [assistWatt, setAssistWatt] = useState(1000);
+  const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3);
+  const [setupMinutes, setSetupMinutes] = useState(6);
 
-  // Nowe: dostawa / opakowanie / Allegro
+  // Dostawa / opakowanie / Allegro
   const [shippingSize, setShippingSize] = useState<ShippingSize>("none");
   const [shippingCostA, setShippingCostA] = useState(15);
   const [shippingCostB, setShippingCostB] = useState(18);
   const [shippingCostC, setShippingCostC] = useState(25);
 
-  const [packagingCost, setPackagingCost] = useState(0); // PLN
-  const [allegroFeePercent, setAllegroFeePercent] = useState(0); // %
+  const [packagingCost, setPackagingCost] = useState(0);
+  const [allegroFeePercent, setAllegroFeePercent] = useState(0);
 
   // Projekty
   const [designs, setDesigns] = useState<Design[]>([]);
 
-  // Skala podgladu
+  // Podgląd
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [viewScale, setViewScale] = useState(1.0);
 
-  /* =========================
-     Instances + Nesting
-     ========================= */
+  /* ===== Instances ===== */
   const instances = useMemo(() => {
     const out: { instanceId: string; designId: string; name: string; w: number; h: number }[] = [];
     for (const d of designs) {
@@ -233,6 +216,7 @@ export default function App() {
     return out;
   }, [designs]);
 
+  /* ===== Nest ===== */
   const nesting = useMemo(() => {
     const items = instances.map((it) => ({ id: it.instanceId, w: it.w, h: it.h, pad: padding }));
     const packed = shelfPack(items, sheetW, sheetH);
@@ -246,9 +230,7 @@ export default function App() {
     return { ok: true as const, placed };
   }, [instances, padding, sheetW, sheetH]);
 
-  /* =========================
-     Draw
-     ========================= */
+  /* ===== Draw ===== */
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
@@ -263,7 +245,6 @@ export default function App() {
     c.height = Math.floor(sheetH * s);
 
     ctx.clearRect(0, 0, c.width, c.height);
-
     ctx.lineWidth = 2;
     ctx.strokeRect(1, 1, c.width - 2, c.height - 2);
 
@@ -307,25 +288,22 @@ export default function App() {
   const totalArea = useMemo(() => instances.reduce((acc, it) => acc + it.w * it.h, 0), [instances]); // mm2
   const sheetArea = sheetW * sheetH; // mm2
 
-  // Liczba arkuszy – NIE zaniżamy (to była logiczna mina w clamp do 1)
-  const sheetsNeeded = useMemo(() => {
-    if (instances.length === 0) return 0;
-    const ratio = totalArea / Math.max(1e-9, sheetArea);
-    return Math.max(1, Math.ceil(ratio));
-  }, [instances.length, totalArea, sheetArea]);
+  // ✅ Proporcjonalne wykorzystanie (bez odpadu) – może być > 1 (np. 1.3 arkusza)
+  const materialUsageRatio = useMemo(() => {
+    if (!nesting.ok || instances.length === 0) return 0;
+    return totalArea / Math.max(1e-9, sheetArea);
+  }, [nesting.ok, instances.length, totalArea, sheetArea]);
 
-  // Koszt materiału dla zamówienia: arkuszeNeeded * sheetCost
+  // ✅ Koszt materiału zamówienia proporcjonalnie
   const materialCostOrder = useMemo(() => {
-    if (sheetsNeeded === 0) return 0;
-    return sheetCost * sheetsNeeded;
-  }, [sheetCost, sheetsNeeded]);
+    if (!nesting.ok || instances.length === 0) return 0;
+    return sheetCost * materialUsageRatio;
+  }, [nesting.ok, instances.length, sheetCost, materialUsageRatio]);
 
-  // Materiał rozbijamy per instancja proporcjonalnie do pola, ale tak żeby suma = materialCostOrder
-  const materialCostPerMm2Effective = useMemo(() => {
-    if (instances.length === 0) return 0;
-    // rozbijamy koszt zamówienia po realnie użytej powierzchni bbox (spójnie)
-    return materialCostOrder / Math.max(1e-9, totalArea);
-  }, [instances.length, materialCostOrder, totalArea]);
+  // PLN/mm2 (stałe) – zgodne z "proporcjonalnym arkuszem"
+  const materialPLNPerMm2 = useMemo(() => {
+    return sheetCost / Math.max(1e-9, sheetArea);
+  }, [sheetCost, sheetArea]);
 
   const timeAndEnergyTotals = useMemo(() => {
     let minutes = setupMinutes;
@@ -346,7 +324,6 @@ export default function App() {
     return { energy, depr, labor, total: energy + depr + labor };
   }, [timeAndEnergyTotals, powerPrice, deprPerHour, laborPerHour]);
 
-  // Koszt produkcji = czas+energia+robocizna+amortyzacja + materiał
   const productionCost = useMemo(() => {
     return orderCostsTime.total + materialCostOrder;
   }, [orderCostsTime.total, materialCostOrder]);
@@ -365,8 +342,6 @@ export default function App() {
 
   /* =========================
      Cena sprzedaży (bez pętli)
-     - marża liczona od (productionCost + shipping + packaging)
-     - NIE doliczamy Allegro/podatków do podstawy, bo to tworzy pętle i "magiczne" zachowania
      ========================= */
   const sellPriceGross = useMemo(() => {
     const base = productionCost + shippingCost + packaging;
@@ -375,21 +350,15 @@ export default function App() {
   }, [productionCost, shippingCost, packaging, marginPercent, minOrderPrice]);
 
   /* =========================
-     Allegro / podatek 8.5 / VAT (wg Twojego wzoru)
+     Allegro / podatek / VAT
      ========================= */
-
-  // Allegro to KOSZT. Liczymy od ceny sprzedaży (brutto), bo tak chcesz,
-  // ale bez sprzężenia, bo sellPriceGross nie zależy od allegroFee.
   const allegroFee = useMemo(() => {
     const p = Math.max(0, allegroFeePercent) / 100;
-    return sellPriceGross * p;
+    return sellPriceGross * p; // ✅ koszt
   }, [sellPriceGross, allegroFeePercent]);
 
   const tax85 = useMemo(() => sellPriceGross * TAX_RATE, [sellPriceGross]);
 
-  // VAT wg Twojego wzoru:
-  // VAT(sprzedaż) - VAT(allegro) - VAT(materiał) - VAT(opakowanie)
-  // (Założenie: kwoty wpisujesz jako brutto z 23% tam gdzie ma to sens.)
   const vatCalc = useMemo(() => {
     const vatSale = vatFromGross(sellPriceGross);
     const vatAllegro = vatFromGross(allegroFee);
@@ -398,9 +367,6 @@ export default function App() {
     return vatSale - vatAllegro - vatMaterial - vatPackaging;
   }, [sellPriceGross, allegroFee, materialCostOrder, packaging]);
 
-  // ZYSK wg Twojego opisu:
-  // cena koncowa z transportem - cena materialu - cena opak - podatek 8.5% - VAT(wg wzoru) - prad i robocizna - allegro
-  // (shipping jest już w sellPriceGross i odejmujemy go jako realny koszt wysyłki)
   const profit = useMemo(() => {
     const revenue = sellPriceGross;
     const costs =
@@ -416,10 +382,9 @@ export default function App() {
   }, [sellPriceGross, materialCostOrder, packaging, shippingCost, tax85, vatCalc, orderCostsTime.total, allegroFee]);
 
   /* =========================
-     Per-item i tabela per projekt (spójna z materiałem)
+     Per projekt (koszty bazowe)
      ========================= */
   const perItemCostBase = useMemo(() => {
-    // koszt bazowy instancji = materiał (spójny z materialCostOrder) + udział kosztów czasu
     if (instances.length === 0) return new Map<string, number>();
 
     const minutesByInstance = new Map<string, number>();
@@ -433,14 +398,14 @@ export default function App() {
 
     const out = new Map<string, number>();
     for (const it of instances) {
-      const mat = (it.w * it.h) * materialCostPerMm2Effective;
+      const mat = (it.w * it.h) * materialPLNPerMm2;
       const m = minutesByInstance.get(it.instanceId) ?? baseMinutesPerItem;
       const timePart = sumM > 0 ? (m / sumM) * orderCostsTime.total : orderCostsTime.total / instances.length;
       out.set(it.instanceId, mat + timePart);
     }
 
     return out;
-  }, [instances, designs, baseMinutesPerItem, materialCostPerMm2Effective, orderCostsTime.total]);
+  }, [instances, designs, baseMinutesPerItem, materialPLNPerMm2, orderCostsTime.total]);
 
   const groupedCostsBase = useMemo(() => {
     const byDesign = new Map<string, { name: string; count: number; sum: number }>();
@@ -519,25 +484,20 @@ export default function App() {
   function exportPdfClient() {
     const { id, date, time } = nowStamp();
 
-    // W PDF: projekty skalujemy tak, żeby suma projektów = "sellPriceGross - shipping - packaging"
-    // (a dostawa/opakowanie pokazane osobno jako pozycje).
+    // PDF: suma projektów = sellPriceGross - dostawa - opakowanie
     const productsTarget = Math.max(0, sellPriceGross - shippingCost - packaging);
 
-    const baseSumCosts = groupedCostsBase.reduce((acc, r) => acc + r.totalCost, 0);
-    // Cena produktów "dla klienta" uzyskujemy przez mnożnik względem kosztów bazowych,
-    // ale docelowo tak, żeby suma = productsTarget
-    const productMultiplier = baseSumCosts > 0 ? productsTarget / baseSumCosts : 1;
+    const baseSum = groupedCostsBase.reduce((acc, r) => acc + r.totalCost, 0);
+    const mult = baseSum > 0 ? productsTarget / baseSum : 1;
 
-    const rows = groupedCostsBase.map((r) => {
-      const unit = r.unitCost * productMultiplier;
-      const total = r.totalCost * productMultiplier;
+    const rows: any[] = groupedCostsBase.map((r) => {
+      const unit = r.unitCost * mult;
+      const total = r.totalCost * mult;
       return [r.name, String(r.qty), fmtPLN(unit), fmtPLN(total)];
     });
 
-    // dodatkowe pozycje
-    const extraRows: any[] = [];
-    if (packaging > 0) extraRows.push(["Opakowanie", "1", fmtPLN(packaging), fmtPLN(packaging)]);
-    if (shippingCost > 0) extraRows.push([`Dostawa (${shippingSize})`, "1", fmtPLN(shippingCost), fmtPLN(shippingCost)]);
+    if (packaging > 0) rows.push(["Opakowanie", "1", fmtPLN(packaging), fmtPLN(packaging)]);
+    if (shippingCost > 0) rows.push([`Dostawa (${shippingSize})`, "1", fmtPLN(shippingCost), fmtPLN(shippingCost)]);
 
     const doc = new jsPDF({ unit: "mm", format: "a4" });
 
@@ -548,16 +508,17 @@ export default function App() {
     doc.text(`Numer: ${id}`, 14, 24);
     doc.text(`Data: ${date} ${time}`, 14, 29);
     doc.text(`Materiał: ${selectedMaterial.name}`, 14, 34);
+    doc.text(`Arkusz: ${sheetW} x ${sheetH} mm`, 14, 39);
 
     autoTable(doc, {
-      startY: 42,
+      startY: 46,
       head: [["Pozycja", "Ilość", "Cena / szt", "Suma"]],
-      body: rows.length ? [...rows, ...extraRows] : [["(brak)", "-", "-", "-"]],
+      body: rows.length ? rows : [["(brak)", "-", "-", "-"]],
       styles: { fontSize: 10 },
       headStyles: { fillColor: [240, 240, 240], textColor: 20 },
     });
 
-    const y = (doc as any).lastAutoTable?.finalY ?? 42;
+    const y = (doc as any).lastAutoTable?.finalY ?? 46;
 
     doc.setFontSize(11);
     doc.text(`RAZEM: ${fmtPLN(sellPriceGross)}`, 14, y + 10);
@@ -572,13 +533,14 @@ export default function App() {
      UI
      ========================= */
   return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-900">
+    <div className="min-h-screen bg-zinc-50 text-zinc-900 pb-24">
       <div className="max-w-6xl mx-auto p-4 md:p-8">
-        <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+        {/* TOP BAR */}
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-2xl md:text-3xl font-semibold">Kalkulator wyceny + nesting (CO2 / sklejka)</h1>
+            <h1 className="text-2xl md:text-3xl font-semibold">Kalkulator wyceny + nesting (CO2)</h1>
             <p className="text-sm text-zinc-600 mt-1">
-              Importuj SVG, ustaw skale i ilosci, a aplikacja ulozy projekty na arkuszu i policzy wycene + zysk (Allegro/VAT/podatek/dostawa).
+              SVG → nesting → wycena + dostawa/opakowanie/Allegro/podatki + PDF.
             </p>
           </div>
 
@@ -593,11 +555,11 @@ export default function App() {
               disabled={!nesting.ok}
               onClick={exportLayoutSvg}
             >
-              Eksport ulozenia (SVG)
+              Eksport SVG
             </button>
 
             <button
-              className="px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 text-sm font-medium"
+              className="px-3 py-2 rounded-xl bg-zinc-900 text-white shadow-sm border border-zinc-900 text-sm font-medium"
               onClick={exportPdfClient}
             >
               PDF dla klienta
@@ -606,8 +568,51 @@ export default function App() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-6">
-          {/* Left: settings */}
+          {/* LEFT */}
           <div className="lg:col-span-1 flex flex-col gap-4">
+            <Card title="Szybkie dopłaty (NA WIDOKU)">
+              <Row label="Gabaryt dostawy">
+                <select
+                  className="w-full px-3 py-2 rounded-xl border border-zinc-200 bg-white text-sm"
+                  value={shippingSize}
+                  onChange={(e) => setShippingSize(e.target.value as ShippingSize)}
+                >
+                  <option value="none">Brak</option>
+                  <option value="A">A</option>
+                  <option value="B">B</option>
+                  <option value="C">C</option>
+                </select>
+              </Row>
+
+              <Row label="Koszt dostawy A">
+                <NumberInput value={shippingCostA} onChange={setShippingCostA} min={0} step={0.5} />
+              </Row>
+              <Row label="Koszt dostawy B">
+                <NumberInput value={shippingCostB} onChange={setShippingCostB} min={0} step={0.5} />
+              </Row>
+              <Row label="Koszt dostawy C">
+                <NumberInput value={shippingCostC} onChange={setShippingCostC} min={0} step={0.5} />
+              </Row>
+
+              {/* ✅ OPakowanie – teraz wysoko i czytelnie */}
+              <Row label="Koszt opakowania (PLN)">
+                <NumberInput value={packagingCost} onChange={setPackagingCost} min={0} step={0.5} />
+              </Row>
+
+              <Row label="Oplata Allegro (%)">
+                <NumberInput value={allegroFeePercent} onChange={setAllegroFeePercent} min={0} step={0.1} />
+              </Row>
+
+              <div className="grid grid-cols-2 gap-3 mt-2">
+                <Stat label="Dostawa" value={fmtPLN(shippingCost)} />
+                <Stat label="Opakowanie" value={fmtPLN(packaging)} />
+                <Stat label="Allegro" value={fmtPLN(allegroFee)} />
+                <Stat label="Podatek 8.5%" value={fmtPLN(tax85)} />
+                <Stat label="VAT (wg wzoru)" value={fmtPLN(vatCalc)} />
+                <Stat label="Zysk" value={fmtPLN(profit)} />
+              </div>
+            </Card>
+
             <Card title="Parametry arkusza">
               <Row label="Szerokosc arkusza (mm)">
                 <NumberInput value={sheetW} onChange={setSheetW} min={1} />
@@ -615,14 +620,14 @@ export default function App() {
               <Row label="Wysokosc arkusza (mm)">
                 <NumberInput value={sheetH} onChange={setSheetH} min={1} />
               </Row>
-              <Row label="Odstep miedzy projektami (mm)">
+              <Row label="Odstep (mm)">
                 <NumberInput value={padding} onChange={setPadding} min={0} step={0.5} />
               </Row>
-              <Row label="Kerf (mm) (informacyjnie)">
+              <Row label="Kerf (mm) (info)">
                 <NumberInput value={kerf} onChange={setKerf} min={0} step={0.01} />
               </Row>
 
-              <Row label="Material">
+              <Row label="Materiał">
                 <select
                   className="w-full px-3 py-2 rounded-xl border border-zinc-200 bg-white text-sm"
                   value={materialId}
@@ -634,6 +639,10 @@ export default function App() {
                     </option>
                   ))}
                 </select>
+              </Row>
+
+              <Row label="Cena arkusza (PLN)">
+                <NumberInput value={sheetCost} onChange={setSheetCostForSelected} min={0} step={0.1} />
               </Row>
 
               <Row label="Zoom podgladu">
@@ -652,11 +661,7 @@ export default function App() {
               </Row>
             </Card>
 
-            <Card title="Koszty produkcji (PLN)">
-              <Row label="Cena arkusza (dla wybranego materialu)">
-                <NumberInput value={sheetCost} onChange={setSheetCostForSelected} min={0} step={0.1} />
-              </Row>
-
+            <Card title="Koszty i marża">
               <Row label="Cena pradu (PLN/kWh)">
                 <NumberInput value={powerPrice} onChange={setPowerPrice} min={0} step={0.01} />
               </Row>
@@ -666,77 +671,40 @@ export default function App() {
               <Row label="Godzina pracy (PLN/h)">
                 <NumberInput value={laborPerHour} onChange={setLaborPerHour} min={0} step={0.1} />
               </Row>
-            </Card>
-
-            <Card title="Dostawa / opakowanie / Allegro / podatki">
-              <Row label="Gabaryt dostawy">
-                <div className="flex flex-col gap-2">
-                  <Radio name="ship" label="Brak" checked={shippingSize === "none"} onChange={() => setShippingSize("none")} />
-                  <Radio name="ship" label="A" checked={shippingSize === "A"} onChange={() => setShippingSize("A")} />
-                  <Radio name="ship" label="B" checked={shippingSize === "B"} onChange={() => setShippingSize("B")} />
-                  <Radio name="ship" label="C" checked={shippingSize === "C"} onChange={() => setShippingSize("C")} />
-                </div>
-              </Row>
-
-              <Row label="Koszt dostawy A (PLN)">
-                <NumberInput value={shippingCostA} onChange={setShippingCostA} min={0} step={0.5} />
-              </Row>
-              <Row label="Koszt dostawy B (PLN)">
-                <NumberInput value={shippingCostB} onChange={setShippingCostB} min={0} step={0.5} />
-              </Row>
-              <Row label="Koszt dostawy C (PLN)">
-                <NumberInput value={shippingCostC} onChange={setShippingCostC} min={0} step={0.5} />
-              </Row>
-
-              <Row label="Koszt opakowania (PLN)">
-                <NumberInput value={packagingCost} onChange={setPackagingCost} min={0} step={0.5} />
-              </Row>
-
-              <Row label="Oplata Allegro (%)">
-                <NumberInput value={allegroFeePercent} onChange={setAllegroFeePercent} min={0} step={0.1} />
-              </Row>
-
-              <Row label="Podatek (8.5%)">
-                <div className="text-sm tabular-nums text-right w-full">{fmtPLN(tax85)}</div>
-              </Row>
-
-              <Row label="VAT (wg wzoru)">
-                <div className="text-sm tabular-nums text-right w-full">{fmtPLN(vatCalc)}</div>
-              </Row>
-
-              <p className="text-xs text-zinc-600 mt-2">
-                Allegro jest kosztem (odejmowane w zysku). VAT liczony jako: VAT(sprzedaż) - VAT(allegro) - VAT(materiał) - VAT(opakowanie).
-              </p>
-            </Card>
-
-            <Card title="Cena sprzedaży">
               <Row label="Marza (%)">
                 <NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} />
               </Row>
               <Row label="Minimalna cena (PLN)">
                 <NumberInput value={minOrderPrice} onChange={setMinOrderPrice} min={0} step={1} />
               </Row>
-              <Stat label="Cena końcowa (sprzedaż)" value={fmtPLN(sellPriceGross)} />
-              <Stat label="Zysk (po Allegro/podatkach/VAT)" value={fmtPLN(profit)} />
+
+              <div className="grid grid-cols-2 gap-3 mt-2">
+                <Stat label="Koszt produkcji" value={fmtPLN(productionCost)} />
+                <Stat label="Cena sprzedaży" value={fmtPLN(sellPriceGross)} />
+              </div>
+
+              <p className="text-xs text-zinc-600 mt-2">
+                Materiał liczony proporcjonalnie: <b>sheetCost * (sum(area)/sheetArea)</b> (bez odpadu).
+              </p>
             </Card>
 
-            <Card title="Model czasu i energii (uproczony)">
+            <Card title="Model czasu i energii">
               <Row label="Laser (W)">
                 <NumberInput value={laserWatt} onChange={setLaserWatt} min={0} step={1} />
               </Row>
               <Row label="Dodatkowe odbiorniki (W)">
                 <NumberInput value={assistWatt} onChange={setAssistWatt} min={0} step={1} />
               </Row>
-              <Row label="Setup na zamowienie (min)">
+              <Row label="Setup (min)">
                 <NumberInput value={setupMinutes} onChange={setSetupMinutes} min={0} step={1} />
               </Row>
-              <Row label="Czas na sztuke (min) (domyslnie)">
+              <Row label="Czas / szt (min)">
                 <NumberInput value={baseMinutesPerItem} onChange={setBaseMinutesPerItem} min={0} step={0.5} />
               </Row>
             </Card>
           </div>
 
-          {/* Right: preview + projects */}
+          {/* RIGHT */}
           <div className="lg:col-span-2 flex flex-col gap-4">
             <Card title="Ulozenie na arkuszu">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -744,15 +712,14 @@ export default function App() {
                   {nesting.ok ? (
                     <span>
                       Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m2</b> • Arkusz:{" "}
-                      <b>{(sheetArea / 1e6).toFixed(3)} m2</b>
+                      <b>{(sheetArea / 1e6).toFixed(3)} m2</b> • Użycie: <b>{(materialUsageRatio * 100).toFixed(1)}%</b>
                     </span>
                   ) : (
                     <span className="text-rose-700">Nie miesci sie na arkuszu — zmniejsz skale/ilosci lub zwieksz arkusz.</span>
                   )}
                 </div>
                 <div className="text-sm text-zinc-700 tabular-nums">
-                  Szac. czas: <b>{timeAndEnergyTotals.minutes.toFixed(0)} min</b> • Energia:{" "}
-                  <b>{timeAndEnergyTotals.kwh.toFixed(2)} kWh</b>
+                  Szac. czas: <b>{timeAndEnergyTotals.minutes.toFixed(0)} min</b> • Energia: <b>{timeAndEnergyTotals.kwh.toFixed(2)} kWh</b>
                 </div>
               </div>
 
@@ -761,25 +728,16 @@ export default function App() {
               </div>
 
               <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
-                <Stat label="Arkusze (ceil)" value={`${sheetsNeeded || 0} szt`} />
-                <Stat label="Materiał (zamówienie)" value={fmtPLN(materialCostOrder)} />
+                <Stat label="Materiał (proporc.)" value={fmtPLN(materialCostOrder)} />
                 <Stat label="Czas+energia" value={fmtPLN(orderCostsTime.total)} />
-                <Stat label="Koszt produkcji" value={fmtPLN(productionCost)} />
-              </div>
-
-              <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
-                <Stat label="Dostawa" value={fmtPLN(shippingCost)} />
-                <Stat label="Opakowanie" value={fmtPLN(packaging)} />
-                <Stat label="Allegro" value={fmtPLN(allegroFee)} />
-                <Stat label="Sprzedaż (cena)" value={fmtPLN(sellPriceGross)} />
+                <Stat label="Dostawa+opak." value={fmtPLN(shippingCost + packaging)} />
+                <Stat label="Cena sprzedaży" value={fmtPLN(sellPriceGross)} />
               </div>
             </Card>
 
             <Card title="Projekty (skala, ilosc, czas)">
               {designs.length === 0 ? (
-                <div className="text-sm text-zinc-600">
-                  Wgraj jeden lub kilka plikow SVG (np. eksport z LightBurn). Najlepiej, gdy SVG ma poprawny viewBox.
-                </div>
+                <div className="text-sm text-zinc-600">Wgraj jeden lub kilka plikow SVG (najlepiej z poprawnym viewBox).</div>
               ) : (
                 <div className="flex flex-col gap-3">
                   {designs.map((d) => {
@@ -794,10 +752,7 @@ export default function App() {
                               Rozmiar: {w.toFixed(1)} x {h.toFixed(1)} • baza: {d.baseW.toFixed(1)} x {d.baseH.toFixed(1)}
                             </div>
                           </div>
-                          <button
-                            className="text-sm px-3 py-1.5 rounded-xl border border-zinc-200 hover:bg-zinc-50"
-                            onClick={() => removeDesign(d.id)}
-                          >
+                          <button className="text-sm px-3 py-1.5 rounded-xl border border-zinc-200 hover:bg-zinc-50" onClick={() => removeDesign(d.id)}>
                             Usun
                           </button>
                         </div>
@@ -819,15 +774,10 @@ export default function App() {
                           </Labeled>
 
                           <Labeled label="Ilosc">
-                            <NumberInput
-                              value={d.qty}
-                              onChange={(v) => updateDesign(d.id, { qty: Math.max(1, Math.floor(v)) })}
-                              min={1}
-                              step={1}
-                            />
+                            <NumberInput value={d.qty} onChange={(v) => updateDesign(d.id, { qty: Math.max(1, Math.floor(v)) })} min={1} step={1} />
                           </Labeled>
 
-                          <Labeled label="Czas / szt (min) (opcjonalnie)">
+                          <Labeled label="Czas / szt (min) opcj.">
                             <NumberInput
                               value={d.minutesOverride ?? 0}
                               onChange={(v) => updateDesign(d.id, { minutesOverride: v <= 0 ? undefined : v })}
@@ -871,14 +821,34 @@ export default function App() {
                 </div>
               )}
               <p className="text-xs text-zinc-600 mt-2">
-                Materiał rozbijany proporcjonalnie do pola bbox, ale suma materiału = koszt materiału zamówienia (arkusze * cena).
+                Materiał per instancja = pole * (sheetCost/sheetArea). Suma materiału = sheetCost * (sum(area)/sheetArea).
               </p>
             </Card>
           </div>
         </div>
+      </div>
 
-        <div className="mt-8 text-xs text-zinc-500">
-          <p>Uwaga: VAT i 8.5% zależą od Twojego rozliczania (brutto/netto, faktury kosztowe). Ten model trzyma Twoje założenia 1:1.</p>
+      {/* Sticky bottom bar (lepsze rozmieszczenie przycisków) */}
+      <div className="fixed bottom-0 left-0 right-0 border-t border-zinc-200 bg-white/90 backdrop-blur">
+        <div className="max-w-6xl mx-auto p-3 flex items-center justify-between gap-2">
+          <div className="text-sm text-zinc-700">
+            Cena: <b className="tabular-nums">{fmtPLN(sellPriceGross)}</b> • Zysk: <b className="tabular-nums">{fmtPLN(profit)}</b>
+          </div>
+          <div className="flex gap-2">
+            <button
+              className="px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 text-sm font-medium disabled:opacity-50"
+              disabled={!nesting.ok}
+              onClick={exportLayoutSvg}
+            >
+              Eksport SVG
+            </button>
+            <button
+              className="px-3 py-2 rounded-xl bg-zinc-900 text-white shadow-sm border border-zinc-900 text-sm font-medium"
+              onClick={exportPdfClient}
+            >
+              PDF dla klienta
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -899,9 +869,9 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between gap-3 py-1.5">
+    <div className="grid grid-cols-1 md:grid-cols-[1fr_220px] items-center gap-2 py-1.5">
       <div className="text-sm text-zinc-700">{label}</div>
-      <div className="w-40">{children}</div>
+      <div>{children}</div>
     </div>
   );
 }
@@ -947,24 +917,5 @@ function Stat({ label, value }: { label: string; value: string }) {
       <div className="text-xs text-zinc-600">{label}</div>
       <div className="text-base font-semibold tabular-nums mt-0.5">{value}</div>
     </div>
-  );
-}
-
-function Radio({
-  name,
-  label,
-  checked,
-  onChange,
-}: {
-  name: string;
-  label: string;
-  checked: boolean;
-  onChange: () => void;
-}) {
-  return (
-    <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-      <input type="radio" name={name} checked={checked} onChange={onChange} />
-      <span className="text-sm">{label}</span>
-    </label>
   );
 }
