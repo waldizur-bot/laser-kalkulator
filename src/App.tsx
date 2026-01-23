@@ -18,6 +18,10 @@ import autoTable from "jspdf-autotable";
  * - Podatek 8,5% od kwoty ktora placi klient
  * - VAT 23% wg: VAT(klient) - VAT(allegro) - VAT(material) - VAT(opakowanie)
  * - Zysk: klient - material - opak - dostawa - podatek - vatCalc - (czas+energia) - allegroFee
+ *
+ * + NOWE: tryb ustalania ceny produktu:
+ * - albo marża (%)
+ * - albo wpisana cena produktu (bez dostawy)
  */
 
 // ------------------------- Helpers -------------------------
@@ -177,6 +181,9 @@ const SHIPPING_LABEL: Record<ShippingSize, string> = {
   C: "Gabaryt C",
 };
 
+// Tryb ceny produktu
+type PricingMode = "margin" | "fixed";
+
 // ------------------------- App -------------------------
 
 export default function App() {
@@ -207,8 +214,10 @@ export default function App() {
   const [deprPerHour, setDeprPerHour] = useState(1.2); // PLN / h
   const [laborPerHour, setLaborPerHour] = useState(31); // PLN / h
 
-  // Cena sprzedazy
+  // Cena sprzedazy (tryb)
+  const [pricingMode, setPricingMode] = useState<PricingMode>("margin");
   const [marginPercent, setMarginPercent] = useState(250); // %
+  const [fixedProductPriceGross, setFixedProductPriceGross] = useState(30); // PLN (bez dostawy)
   const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
 
   // Maszyna (uproczony model czasu/energii)
@@ -217,7 +226,7 @@ export default function App() {
   const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt
   const [setupMinutes, setSetupMinutes] = useState(6); // min / zamowienie
 
-  // NOWE: dostawa / opakowanie / allegro / podatki
+  // Dostawa / opakowanie / allegro / podatki
   const [shippingSize, setShippingSize] = useState<ShippingSize>("none");
   const [shippingA, setShippingA] = useState(10);
   const [shippingB, setShippingB] = useState(15);
@@ -322,7 +331,7 @@ export default function App() {
 
   const sheetArea = sheetW * sheetH; // mm2
 
-  // PLN / mm2
+  // PLN / mm2 (do rozbijania na sztuki w tabelce bazowej)
   const materialShare = useMemo(() => {
     if (!nesting.ok || instances.length === 0) return 0;
     return sheetCost / Math.max(1e-9, sheetArea);
@@ -360,12 +369,12 @@ export default function App() {
     return { energy, depr, labor, total: energy + depr + labor };
   }, [timeAndEnergyTotals, powerPrice, deprPerHour, laborPerHour]);
 
-  // koszt produkcji (czas+energia + material) - bez opakowania i dostawy (to osobno)
+  // koszt produkcji (czas+energia + material) - bez opakowania i dostawy
   const productionCost = useMemo(() => {
     return orderCostsTime.total + materialCostOrder;
   }, [orderCostsTime.total, materialCostOrder]);
 
-  // Dostawa: koszt (Ty placisz kuriera), ale klient zwraca w platnosci
+  // Dostawa (klient płaci + Ty płacisz kuriera jako koszt)
   const shippingCost = useMemo(() => {
     if (shippingSize === "none") return 0;
     if (shippingSize === "A") return Math.max(0, shippingA);
@@ -373,12 +382,25 @@ export default function App() {
     return Math.max(0, shippingC);
   }, [shippingSize, shippingA, shippingB, shippingC]);
 
-  // Cena produktu (bez dostawy), ale z opakowaniem i marza
+  // Baza do marży: produkcja + opakowanie
+  const baseForPricing = useMemo(() => {
+    return productionCost + Math.max(0, packaging);
+  }, [productionCost, packaging]);
+
+  // Cena produktu (bez dostawy): albo liczona z marży, albo wpisana ręcznie
   const productPriceGross = useMemo(() => {
-    const base = productionCost + Math.max(0, packaging);
-    const withMargin = base * (1 + Math.max(0, marginPercent) / 100);
+    if (pricingMode === "fixed") {
+      return Math.max(Math.max(0, fixedProductPriceGross), Math.max(0, minOrderPrice));
+    }
+    const withMargin = baseForPricing * (1 + Math.max(0, marginPercent) / 100);
     return Math.max(withMargin, Math.max(0, minOrderPrice));
-  }, [productionCost, packaging, marginPercent, minOrderPrice]);
+  }, [pricingMode, fixedProductPriceGross, baseForPricing, marginPercent, minOrderPrice]);
+
+  // Marża wynikowa (gdy tryb "fixed") — pokazujemy informacyjnie
+  const impliedMarginPercent = useMemo(() => {
+    if (baseForPricing <= 0) return 0;
+    return ((productPriceGross / baseForPricing) - 1) * 100;
+  }, [productPriceGross, baseForPricing]);
 
   // Klient placi: produkt + dostawa
   const customerPaysGross = useMemo(() => {
@@ -404,7 +426,7 @@ export default function App() {
     return vatSale - vatAllegro - vatMaterial - vatPackaging;
   }, [customerPaysGross, allegroFee, materialCostOrder, packaging]);
 
-  // Zysk wg Twojego wzoru (z dostawa w przychodzie i jako koszt)
+  // Zysk wg Twojego wzoru
   const profit = useMemo(() => {
     const revenue = customerPaysGross;
     const costs =
@@ -417,7 +439,18 @@ export default function App() {
       allegroFee;
 
     return revenue - costs;
-  }, [customerPaysGross, materialCostOrder, packaging, shippingCost, tax85, vatCalc, orderCostsTime.total, allegroFee]);
+  }, [
+    customerPaysGross,
+    materialCostOrder,
+    packaging,
+    shippingCost,
+    tax85,
+    vatCalc,
+    orderCostsTime.total,
+    allegroFee,
+  ]);
+
+  // --------- Baza per projekt (tabelka) ---------
 
   const perItemPrice = useMemo(() => {
     if (instances.length === 0) return new Map<string, number>();
@@ -502,7 +535,9 @@ export default function App() {
     const svgClose = `</svg>\n`;
 
     const body: string[] = [];
-    body.push(`<rect x="0" y="0" width="${sheetW}" height="${sheetH}" fill="none" stroke="black" stroke-width="0.2"/>`);
+    body.push(
+      `<rect x="0" y="0" width="${sheetW}" height="${sheetH}" fill="none" stroke="black" stroke-width="0.2"/>`
+    );
 
     for (const p of nesting.placed) {
       const d = designs.find((x) => x.id === p.designId);
@@ -524,7 +559,7 @@ export default function App() {
 
     // Rozbijamy "cena produktu" na projekty proporcjonalnie (bez dostawy)
     const baseSum = groupedPrices.reduce((acc, r) => acc + r.total, 0);
-    const productsTarget = Math.max(0, productPriceGross); // cena produktu (z marza i opakowaniem)
+    const productsTarget = Math.max(0, productPriceGross); // cena produktu (bez dostawy)
     const multiplier = baseSum > 0 ? productsTarget / baseSum : 1;
 
     const rows = groupedPrices.map((r) => {
@@ -557,7 +592,8 @@ export default function App() {
     // Dodatkowe pozycje
     const extraRows: string[][] = [];
     if (packaging > 0) extraRows.push(["Opakowanie", "1", fmtPLN(packaging), fmtPLN(packaging)]);
-    if (shippingCost > 0) extraRows.push([`Dostawa (${SHIPPING_LABEL[shippingSize]})`, "1", fmtPLN(shippingCost), fmtPLN(shippingCost)]);
+    if (shippingCost > 0)
+      extraRows.push([`Dostawa (${SHIPPING_LABEL[shippingSize]})`, "1", fmtPLN(shippingCost), fmtPLN(shippingCost)]);
 
     if (extraRows.length) {
       autoTable(doc, {
@@ -595,7 +631,13 @@ export default function App() {
 
           <div className="flex gap-2 flex-wrap">
             <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 cursor-pointer">
-              <input type="file" accept="image/svg+xml" multiple className="hidden" onChange={(e) => onAddSvg(e.target.files)} />
+              <input
+                type="file"
+                accept="image/svg+xml"
+                multiple
+                className="hidden"
+                onChange={(e) => onAddSvg(e.target.files)}
+              />
               <span className="text-sm font-medium">Wgraj SVG</span>
             </label>
 
@@ -678,12 +720,59 @@ export default function App() {
                 <NumberInput value={laborPerHour} onChange={setLaborPerHour} min={0} step={0.1} />
               </Row>
 
-              <Row label="Marza (%)">
-                <NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} />
-              </Row>
-              <Row label="Minimalna cena (PLN)">
-                <NumberInput value={minOrderPrice} onChange={setMinOrderPrice} min={0} step={1} />
-              </Row>
+              {/* NOWE: tryb ceny */}
+              <div className="mt-3 rounded-2xl border border-zinc-200 bg-white p-3">
+                <div className="text-sm font-medium mb-2">Ustalanie ceny produktu</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPricingMode("margin")}
+                    className={`px-3 py-2 rounded-xl border text-sm ${
+                      pricingMode === "margin"
+                        ? "bg-zinc-900 text-white border-zinc-900"
+                        : "bg-white text-zinc-900 border-zinc-200"
+                    }`}
+                  >
+                    Marża (%)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPricingMode("fixed")}
+                    className={`px-3 py-2 rounded-xl border text-sm ${
+                      pricingMode === "fixed"
+                        ? "bg-zinc-900 text-white border-zinc-900"
+                        : "bg-white text-zinc-900 border-zinc-200"
+                    }`}
+                  >
+                    Cena produktu (PLN)
+                  </button>
+                </div>
+
+                {pricingMode === "margin" ? (
+                  <div className="mt-3">
+                    <Row label="Marza (%)">
+                      <NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} />
+                    </Row>
+                    <div className="text-xs text-zinc-600 mt-2">
+                      Baza do marży: koszt produkcji + opakowanie = <b>{fmtPLN(baseForPricing)}</b>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-3">
+                    <Row label="Cena produktu (bez dostawy) PLN">
+                      <NumberInput value={fixedProductPriceGross} onChange={setFixedProductPriceGross} min={0} step={0.5} />
+                    </Row>
+                    <div className="text-xs text-zinc-600 mt-2">
+                      Baza: <b>{fmtPLN(baseForPricing)}</b> • Marża wynikowa:{" "}
+                      <b>{Number.isFinite(impliedMarginPercent) ? impliedMarginPercent.toFixed(1) : "0.0"}%</b>
+                    </div>
+                  </div>
+                )}
+
+                <Row label="Minimalna cena (PLN)">
+                  <NumberInput value={minOrderPrice} onChange={setMinOrderPrice} min={0} step={1} />
+                </Row>
+              </div>
             </Card>
 
             <Card title="Dostawa / opakowanie / Allegro / podatki">
@@ -698,7 +787,9 @@ export default function App() {
                     type="button"
                     onClick={() => setShippingSize(k)}
                     className={`px-3 py-2 rounded-xl border text-sm ${
-                      shippingSize === k ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-900 border-zinc-200"
+                      shippingSize === k
+                        ? "bg-zinc-900 text-white border-zinc-900"
+                        : "bg-white text-zinc-900 border-zinc-200"
                     }`}
                   >
                     {SHIPPING_LABEL[k]}
@@ -824,7 +915,9 @@ export default function App() {
                                 max={3}
                                 step={0.05}
                                 value={d.scale}
-                                onChange={(e) => updateDesign(d.id, { scale: clamp(Number(e.target.value), 0.05, 10) })}
+                                onChange={(e) =>
+                                  updateDesign(d.id, { scale: clamp(Number(e.target.value), 0.05, 10) })
+                                }
                                 className="w-full"
                               />
                               <span className="text-sm tabular-nums w-14 text-right">{d.scale.toFixed(2)}x</span>
@@ -884,7 +977,7 @@ export default function App() {
                 </div>
               )}
               <p className="text-xs text-zinc-600 mt-2">
-                Baza = rozbicie kosztow czasu+energii + material proporcjonalnie (bbox). Cena klienta jest liczona osobno (marza + opakowanie + dostawa).
+                Baza = rozbicie kosztow czasu+energii + material proporcjonalnie (bbox). Cena klienta jest liczona osobno (cena produktu + dostawa).
               </p>
             </Card>
           </div>
