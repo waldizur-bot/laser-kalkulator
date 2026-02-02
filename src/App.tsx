@@ -383,7 +383,7 @@ export default function App() {
         <div className="flex items-center gap-3">
             <div className="bg-indigo-600 p-2 rounded text-white"><Scissors size={20}/></div>
             <h1 className="font-bold text-xl tracking-tight leading-none">
-                <span className="text-slate-900">Wycena </span><span className="text-indigo-600">Cięcia</span>
+                <span className="text-slate-900">Wycena</span><span className="text-indigo-600">Cięcia</span>
             </h1>
         </div>
         <div className="flex gap-2">
