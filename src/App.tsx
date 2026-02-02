@@ -1,122 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import {
+  Scissors, Settings2, Zap, ShoppingBag, TrendingUp, Trash2, Plus, FileText,
+  Download, Edit3, RotateCw, X, Move, RefreshCw, MousePointer2, Clock
+} from "lucide-react";
 
-/**
- * Prototyp webowej aplikacji do:
- * - wgrywania plikow SVG (np. eksport z LightBurn)
- * - skalowania i ustawiania ilosci projektow
- * - prostego nestingu (heurystyka: shelf/row packing) na arkuszu
- * - wyliczania ceny kazdego projektu osobno (material + energia + amortyzacja + robocizna)
- * - eksportu ulozenia do SVG (do ponownego otwarcia w LightBurn)
- * - eksportu PDF dla klienta z wycena
- *
- * + Rozszerzone koszty:
- * - Dostawa: brak / A / B / C (klient placi za dostawe)
- * - Opakowanie (PLN)
- * - Oplata Allegro (% od kwoty ktora placi klient) -> KOSZT
- * - Podatek 8,5% od kwoty ktora placi klient
- * - VAT 23% wg: VAT(klient) - VAT(allegro) - VAT(material) - VAT(opakowanie)
- * - Zysk: klient - material - opak - dostawa - podatek - vatCalc - (czas+energia) - allegroFee
- *
- * + NOWE: tryb ustalania ceny produktu:
- * - albo marża (%)
- * - albo wpisana cena produktu (bez dostawy)
- */
+// --- HELPERS ---
 
-// ------------------------- Helpers -------------------------
-
-function mmToPx(mm: number, scale: number) {
-  return mm * scale;
-}
-
-function clamp(n: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, n));
-}
-
-// Bardzo uproszczony odczyt rozmiaru SVG: viewBox > width/height.
-function parseSvgSize(svgText: string): { w: number; h: number } {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(svgText, "image/svg+xml");
-  const svg = doc.querySelector("svg");
-  if (!svg) return { w: 100, h: 100 };
-
-  const vb = svg.getAttribute("viewBox");
-  if (vb) {
-    const parts = vb
-      .split(/[ ,]+/)
-      .map((x) => x.trim())
-      .filter(Boolean)
-      .map((x) => Number(x));
-    if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
-      return { w: parts[2], h: parts[3] };
-    }
-  }
-
-  const wAttr = svg.getAttribute("width");
-  const hAttr = svg.getAttribute("height");
-  const w = wAttr ? parseFloat(wAttr) : NaN;
-  const h = hAttr ? parseFloat(hAttr) : NaN;
-  if (Number.isFinite(w) && Number.isFinite(h)) return { w, h };
-
-  return { w: 100, h: 100 };
-}
-
-function makeId() {
-  return Math.random().toString(36).slice(2, 9);
-}
-
-// Prosty shelf packing: sortuj malejaco po wysokosci, ukladaj w rzedach.
-function shelfPack(
-  items: { id: string; w: number; h: number; pad: number }[],
-  binW: number,
-  binH: number
-): { ok: boolean; placed: Record<string, { x: number; y: number }> } {
-  const placed: Record<string, { x: number; y: number }> = {};
-  const sorted = [...items].sort((a, b) => b.h - a.h);
-
-  let cursorX = 0;
-  let cursorY = 0;
-  let rowH = 0;
-
-  for (const it of sorted) {
-    const W = it.w + it.pad * 2;
-    const H = it.h + it.pad * 2;
-
-    if (W > binW || H > binH) return { ok: false, placed: {} };
-
-    if (cursorX + W > binW) {
-      cursorX = 0;
-      cursorY += rowH;
-      rowH = 0;
-    }
-
-    if (cursorY + H > binH) return { ok: false, placed: {} };
-
-    placed[it.id] = { x: cursorX + it.pad, y: cursorY + it.pad };
-    cursorX += W;
-    rowH = Math.max(rowH, H);
-  }
-
-  return { ok: true, placed };
-}
-
-function downloadText(filename: string, text: string) {
-  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function fmtPLN(n: number) {
-  const x = Number.isFinite(n) ? n : 0;
-  return `${x.toFixed(2)} PLN`;
-}
+function mmToPx(mm: number, scale: number) { return mm * scale; }
+function pxToMm(px: number, scale: number) { return px / scale; }
+function clamp(n: number, a: number, b: number) { return Math.max(a, Math.min(b, n)); }
+function fmtPLN(n: number) { return `${(n || 0).toFixed(2)} PLN`; }
+function makeId() { return Math.random().toString(36).slice(2, 9); }
 
 function nowStamp() {
   const d = new Date();
@@ -125,932 +21,550 @@ function nowStamp() {
   const dd = String(d.getDate()).padStart(2, "0");
   const hh = String(d.getHours()).padStart(2, "0");
   const mi = String(d.getMinutes()).padStart(2, "0");
-  return {
-    date: `${yyyy}-${mm}-${dd}`,
-    time: `${hh}:${mi}`,
-    id: `WYC-${yyyy}${mm}${dd}-${hh}${mi}`,
-  };
+  return { date: `${yyyy}-${mm}-${dd}`, time: `${hh}:${mi}`, id: `WYC-${yyyy}${mm}${dd}-${hh}${mi}` };
 }
 
-// VAT helper: z kwoty brutto (zawiera 23%) wyciaga sam VAT
 function vatFromGross(gross: number, vatRate = 0.23) {
   const g = Math.max(0, gross);
   return (g * vatRate) / (1 + vatRate);
 }
 
-// ------------------------- Types -------------------------
+function isColliding(r1: any, r2: any) {
+  return !(r2.x >= r1.x + r1.w || 
+           r2.x + r2.w <= r1.x || 
+           r2.y >= r1.y + r1.h || 
+           r2.y + r2.h <= r1.y);
+}
 
-type Design = {
-  id: string;
-  name: string;
-  svgText: string;
-  baseW: number;
-  baseH: number;
-  scale: number;
-  qty: number;
-  minutesOverride?: number;
-};
+function parseSvgSize(svgText: string): { w: number; h: number } {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(svgText, "image/svg+xml");
+  const svg = doc.querySelector("svg");
+  if (!svg) return { w: 100, h: 100 };
+  const vb = svg.getAttribute("viewBox");
+  if (vb) {
+    const parts = vb.split(/[ ,]+/).map((x) => parseFloat(x)).filter((n) => !isNaN(n));
+    if (parts.length === 4) return { w: parts[2], h: parts[3] };
+  }
+  return { 
+    w: parseFloat(svg.getAttribute("width") || "100"), 
+    h: parseFloat(svg.getAttribute("height") || "100") 
+  };
+}
 
-type Placed = {
-  instanceId: string;
-  designId: string;
-  name: string;
-  w: number;
-  h: number;
-  x: number;
-  y: number;
-};
+// --- NESTING ALGORITHM (Guillotine) ---
 
-type MaterialProfile = {
-  id: string;
-  name: string;
-  sheetCost: number;
-};
+type Node = { x: number; y: number; w: number; h: number; used: boolean; down: Node | null; right: Node | null };
+
+function fit(node: Node, w: number, h: number): Node | null {
+    if (node.used) return fit(node.right!, w, h) || fit(node.down!, w, h);
+    else if (w <= node.w && h <= node.h) return node;
+    return null;
+}
+
+function splitNode(node: Node, w: number, h: number) {
+    node.used = true;
+    node.down = { x: node.x, y: node.y + h, w: node.w, h: node.h - h, used: false, down: null, right: null };
+    node.right = { x: node.x + w, y: node.y, w: node.w - w, h: h, used: false, down: null, right: null };
+    return node;
+}
+
+function packGuillotine(items: any[], binW: number, binH: number, allowRotation: boolean) {
+  const root: Node = { x: 0, y: 0, w: binW, h: binH, used: false, down: null, right: null };
+  const placed: any[] = [];
+  const sorted = [...items].sort((a, b) => (b.w * b.h) - (a.w * a.h));
+  
+  for (const item of sorted) {
+      const w = item.w + item.pad * 2;
+      const h = item.h + item.pad * 2;
+      let node = fit(root, w, h);
+      let rotated = false;
+
+      if (allowRotation) {
+          const nodeR = fit(root, h, w);
+          if (nodeR && (!node || (nodeR.y < node.y) || (nodeR.y === node.y && nodeR.x < node.x))) {
+              node = nodeR;
+              rotated = true;
+          }
+      }
+
+      if (node) {
+          splitNode(node, rotated ? h : w, rotated ? w : h);
+          placed.push({ ...item, x: node.x + item.pad, y: node.y + item.pad, rotated });
+      } else {
+          placed.push({ ...item, x: 0, y: binH + 10, rotated: false, error: true });
+      }
+  }
+  return placed;
+}
+
+// --- TYPES & CONSTANTS ---
+
+type Design = { id: string; name: string; svgText: string; baseW: number; baseH: number; scale: number; qty: number; minutesOverride?: number; };
+type LayoutItem = { instanceId: string; designId: string; x: number; y: number; w: number; h: number; rotated: boolean; error?: boolean };
+type MaterialProfile = { id: string; name: string; sheetCost: number; defaultW: number; defaultH: number; };
 
 const MATERIALS_DEFAULT: MaterialProfile[] = [
-  { id: "plywood_3", name: "Sklejka 3 mm", sheetCost: 20 },
-  { id: "hdf_3", name: "HDF 3 mm", sheetCost: 10 },
+  { id: "plywood_3", name: "Sklejka 3 mm", sheetCost: 20, defaultW: 600, defaultH: 400 },
+  { id: "hdf_3", name: "HDF 3 mm", sheetCost: 10, defaultW: 800, defaultH: 600 },
 ];
 
-// Dostawa: gabaryty
 type ShippingSize = "none" | "A" | "B" | "C";
-const SHIPPING_LABEL: Record<ShippingSize, string> = {
-  none: "Brak",
-  A: "Gabaryt A",
-  B: "Gabaryt B",
-  C: "Gabaryt C",
-};
 
-// Tryb ceny produktu
-type PricingMode = "margin" | "fixed";
-
-// ------------------------- App -------------------------
+// --- MAIN APP ---
 
 export default function App() {
-  // Arkusz
-  const [sheetW, setSheetW] = useState(762); // mm
-  const [sheetH, setSheetH] = useState(762); // mm
-  const [kerf, setKerf] = useState(0.15); // mm
-  const [padding, setPadding] = useState(1); // mm
+  // STATE: Materials
+  const [materials, setMaterials] = useState<MaterialProfile[]>(() => {
+      try { return JSON.parse(localStorage.getItem("materials_v3") || "") || MATERIALS_DEFAULT; } 
+      catch { return MATERIALS_DEFAULT; }
+  });
+  const [materialId, setMaterialId] = useState<string>(materials[0].id);
+  const [isEditingMaterials, setIsEditingMaterials] = useState(false);
 
-  // Materialy
-  const [materials, setMaterials] = useState<MaterialProfile[]>(MATERIALS_DEFAULT);
-  const [materialId, setMaterialId] = useState<string>(MATERIALS_DEFAULT[0].id);
+  // STATE: Sheet
+  const [sheetW, setSheetW] = useState(materials[0].defaultW);
+  const [sheetH, setSheetH] = useState(materials[0].defaultH);
+  const [padding, setPadding] = useState(2);
+  const [allowRotation, setAllowRotation] = useState(true);
 
-  const selectedMaterial = useMemo(() => {
-    return materials.find((m) => m.id === materialId) ?? materials[0];
-  }, [materials, materialId]);
+  // STATE: Costs
+  const [powerPrice, setPowerPrice] = useState(1.1);
+  const [deprPerHour, setDeprPerHour] = useState(1.2);
+  const [laborPerHour, setLaborPerHour] = useState(35);
 
-  const sheetCost = selectedMaterial.sheetCost; // PLN / arkusz
+  // STATE: Pricing
+  const [pricingMode, setPricingMode] = useState<"margin" | "fixed">("margin");
+  const [marginPercent, setMarginPercent] = useState(200);
+  const [fixedProductPriceGross, setFixedProductPriceGross] = useState(50);
+  const [minOrderPrice, setMinOrderPrice] = useState(20);
 
-  const setSheetCostForSelected = (v: number) => {
-    setMaterials((prev) =>
-      prev.map((m) => (m.id === materialId ? { ...m, sheetCost: Math.max(0, v) } : m))
-    );
-  };
+  // STATE: Machine
+  const [laserWatt, setLaserWatt] = useState(100);
+  const [assistWatt, setAssistWatt] = useState(1000);
+  const [setupMinutes, setSetupMinutes] = useState(5);
+  const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(2);
 
-  // Koszty
-  const [powerPrice, setPowerPrice] = useState(1.1); // PLN / kWh
-  const [deprPerHour, setDeprPerHour] = useState(1.2); // PLN / h
-  const [laborPerHour, setLaborPerHour] = useState(31); // PLN / h
-
-  // Cena sprzedazy (tryb)
-  const [pricingMode, setPricingMode] = useState<PricingMode>("margin");
-  const [marginPercent, setMarginPercent] = useState(250); // %
-  const [fixedProductPriceGross, setFixedProductPriceGross] = useState(30); // PLN (bez dostawy)
-  const [minOrderPrice, setMinOrderPrice] = useState(10); // PLN
-
-  // Maszyna (uproczony model czasu/energii)
-  const [laserWatt, setLaserWatt] = useState(200); // W
-  const [assistWatt, setAssistWatt] = useState(1000); // W
-  const [baseMinutesPerItem, setBaseMinutesPerItem] = useState(3); // min / szt
-  const [setupMinutes, setSetupMinutes] = useState(6); // min / zamowienie
-
-  // Dostawa / opakowanie / allegro / podatki
+  // STATE: Logistics
   const [shippingSize, setShippingSize] = useState<ShippingSize>("none");
-  const [shippingA, setShippingA] = useState(10);
-  const [shippingB, setShippingB] = useState(15);
-  const [shippingC, setShippingC] = useState(20);
+  const [shippingPrices, setShippingPrices] = useState({ A: 15, B: 20, C: 30 });
+  const [packaging, setPackaging] = useState(5);
+  const [allegroFeePercent, setAllegroFeePercent] = useState(10);
 
-  const [packaging, setPackaging] = useState(2); // PLN
-  const [allegroFeePercent, setAllegroFeePercent] = useState(12); // %
-
-  // Projekty
+  // STATE: Data
   const [designs, setDesigns] = useState<Design[]>([]);
-
-  // Skala podgladu
+  const [layout, setLayout] = useState<LayoutItem[]>([]);
+  
+  // STATE: UI
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [viewScale, setViewScale] = useState(1.0);
+  const [isPdfLoading, setIsPdfLoading] = useState(false);
+  const [dragState, setDragState] = useState<{ id: string, startX: number, startY: number, initItemX: number, initItemY: number } | null>(null);
 
-  // Zbuduj liste instancji do nestingu
-  const instances = useMemo(() => {
-    const out: { instanceId: string; designId: string; name: string; w: number; h: number }[] = [];
-    for (const d of designs) {
-      const w = d.baseW * d.scale;
-      const h = d.baseH * d.scale;
-      for (let i = 0; i < d.qty; i++) {
-        out.push({ instanceId: `${d.id}__${i + 1}`, designId: d.id, name: d.name, w, h });
+  // --- EFFECTS ---
+
+  useEffect(() => { localStorage.setItem("materials_v3", JSON.stringify(materials)); }, [materials]);
+
+  const selectedMaterial = useMemo(() => materials.find((m) => m.id === materialId) ?? materials[0], [materials, materialId]);
+
+  const handleMaterialChange = (newId: string) => {
+      setMaterialId(newId);
+      const mat = materials.find(m => m.id === newId);
+      if (mat) { setSheetW(mat.defaultW); setSheetH(mat.defaultH); }
+  };
+
+  // Sync Layout
+  useEffect(() => {
+      const neededInstances: LayoutItem[] = [];
+      designs.forEach(d => {
+          for(let i=0; i<d.qty; i++) {
+              const instanceId = `${d.id}__${i}`;
+              const existing = layout.find(l => l.instanceId === instanceId);
+              const w = d.baseW * d.scale;
+              const h = d.baseH * d.scale;
+              if (existing) { neededInstances.push({ ...existing, w, h }); } 
+              else { neededInstances.push({ instanceId, designId: d.id, x: 0, y: 0, w, h, rotated: false }); }
+          }
+      });
+      if (neededInstances.length !== layout.length || neededInstances.some((n, i) => n.w !== layout[i]?.w)) {
+          setLayout(neededInstances);
       }
-    }
-    return out;
+      // eslint-disable-next-line
   }, [designs]);
 
-  // NEST
-  const nesting = useMemo(() => {
-    const items = instances.map((it) => ({ id: it.instanceId, w: it.w, h: it.h, pad: padding }));
-    const packed = shelfPack(items, sheetW, sheetH);
-    if (!packed.ok) return { ok: false as const, placed: [] as Placed[] };
+  // --- LOGIC ---
 
-    const placed: Placed[] = instances.map((it) => {
-      const p = packed.placed[it.instanceId];
-      return { ...it, x: p.x, y: p.y };
-    });
+  const runAutoNest = () => {
+      const itemsToPack = layout.map(l => ({ ...l, pad: padding }));
+      const packed = packGuillotine(itemsToPack, sheetW, sheetH, allowRotation);
+      setLayout(packed.map((p: any) => ({
+          instanceId: p.instanceId, designId: p.designId, x: p.x, y: p.y, w: p.w, h: p.h, rotated: p.rotated, error: p.error
+      })));
+  };
 
-    return { ok: true as const, placed };
-  }, [instances, padding, sheetW, sheetH]);
+  // Canvas Interactions
+  const getMousePos = (e: React.MouseEvent) => {
+      if (!canvasRef.current) return { x: 0, y: 0 };
+      const rect = canvasRef.current.getBoundingClientRect();
+      const scaleX = canvasRef.current.width / rect.width;
+      const scaleY = canvasRef.current.height / rect.height;
+      const x = (e.clientX - rect.left) * scaleX;
+      const y = (e.clientY - rect.top) * scaleY;
+      const s = Math.min(800/sheetW, 500/sheetH) * viewScale;
+      return { x: pxToMm(x, s), y: pxToMm(y, s) };
+  };
 
-  // Rysuj arkusz i polozenia
-  useEffect(() => {
-    const c = canvasRef.current;
-    if (!c) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
+  const handleMouseDown = (e: React.MouseEvent) => {
+      const { x, y } = getMousePos(e);
+      for (let i = layout.length - 1; i >= 0; i--) {
+          const l = layout[i];
+          const itemW = l.rotated ? l.h : l.w;
+          const itemH = l.rotated ? l.w : l.h;
+          if (x >= l.x && x <= l.x + itemW && y >= l.y && y <= l.y + itemH) {
+              setDragState({ id: l.instanceId, startX: x, startY: y, initItemX: l.x, initItemY: l.y });
+              return;
+          }
+      }
+  };
 
-    const maxW = 1000;
-    const maxH = 520;
-    const s = Math.min(maxW / sheetW, maxH / sheetH) * viewScale;
+  const handleMouseMove = (e: React.MouseEvent) => {
+      if (!dragState) return;
+      const { x, y } = getMousePos(e);
+      const dx = x - dragState.startX;
+      const dy = y - dragState.startY;
+      setLayout(prev => prev.map(l => {
+          if (l.instanceId === dragState.id) return { ...l, x: dragState.initItemX + dx, y: dragState.initItemY + dy };
+          return l;
+      }));
+  };
 
-    c.width = Math.floor(sheetW * s);
-    c.height = Math.floor(sheetH * s);
+  const handleMouseUp = () => setDragState(null);
+  const handleDoubleClick = (e: React.MouseEvent) => {
+      const { x, y } = getMousePos(e);
+      for (let i = layout.length - 1; i >= 0; i--) {
+          const l = layout[i];
+          const itemW = l.rotated ? l.h : l.w;
+          const itemH = l.rotated ? l.w : l.h;
+          if (x >= l.x && x <= l.x + itemW && y >= l.y && y <= l.y + itemH) {
+             setLayout(prev => prev.map(item => item.instanceId === l.instanceId ? { ...item, rotated: !item.rotated } : item));
+             return;
+          }
+      }
+  };
 
-    ctx.clearRect(0, 0, c.width, c.height);
+  // Calculations
+  const totalArea = layout.reduce((acc, l) => acc + (l.w * l.h), 0);
+  const sheetArea = sheetW * sheetH;
+  
+  const collisions = useMemo(() => {
+      const colSet = new Set<string>();
+      const items = layout.map(l => ({ id: l.instanceId, x: l.x, y: l.y, w: l.rotated ? l.h : l.w, h: l.rotated ? l.w : l.h }));
+      for(let i=0; i<items.length; i++) {
+          if (items[i].x < 0 || items[i].y < 0 || items[i].x + items[i].w > sheetW || items[i].y + items[i].h > sheetH) colSet.add(items[i].id);
+          for(let j=i+1; j<items.length; j++) {
+              if (isColliding(items[i], items[j])) { colSet.add(items[i].id); colSet.add(items[j].id); }
+          }
+      }
+      return colSet;
+  }, [layout, sheetW, sheetH]);
 
-    ctx.lineWidth = 2;
-    ctx.strokeRect(1, 1, c.width - 2, c.height - 2);
-
-    ctx.globalAlpha = 0.25;
-    ctx.lineWidth = 1;
-    for (let x = 50; x < sheetW; x += 50) {
-      ctx.beginPath();
-      ctx.moveTo(mmToPx(x, s), 0);
-      ctx.lineTo(mmToPx(x, s), c.height);
-      ctx.stroke();
-    }
-    for (let y = 50; y < sheetH; y += 50) {
-      ctx.beginPath();
-      ctx.moveTo(0, mmToPx(y, s));
-      ctx.lineTo(c.width, mmToPx(y, s));
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-
-    if (!nesting.ok) {
-      ctx.font = "16px sans-serif";
-      ctx.fillText("Nie miesci sie na arkuszu — zmniejsz skale/ilosc albo zwieksz arkusz.", 10, 24);
-      return;
-    }
-
-    ctx.lineWidth = 2;
-    ctx.font = "12px sans-serif";
-
-    nesting.placed.forEach((p) => {
-      const x = mmToPx(p.x, s);
-      const y = mmToPx(p.y, s);
-      const w = mmToPx(p.w, s);
-      const h = mmToPx(p.h, s);
-      ctx.strokeRect(x, y, w, h);
-      ctx.fillText(p.instanceId, x + 4, y + 14);
-    });
-  }, [nesting, sheetW, sheetH, viewScale]);
-
-  // ------------------------- Koszty -------------------------
-
-  const totalArea = useMemo(() => {
-    return instances.reduce((acc, it) => acc + it.w * it.h, 0); // mm2
-  }, [instances]);
-
-  const sheetArea = sheetW * sheetH; // mm2
-
-  // PLN / mm2 (do rozbijania na sztuki w tabelce bazowej)
-  const materialShare = useMemo(() => {
-    if (!nesting.ok || instances.length === 0) return 0;
-    return sheetCost / Math.max(1e-9, sheetArea);
-  }, [nesting.ok, instances.length, sheetCost, sheetArea]);
-
-  // wykorzystanie arkusza i koszt materialu dla zamowienia
-  const materialUsage = useMemo(() => {
-    if (instances.length === 0) return 0;
-    return clamp(totalArea / Math.max(1e-9, sheetArea), 0, 1);
-  }, [instances.length, totalArea, sheetArea]);
-
-  const materialCostOrder = useMemo(() => {
-    return sheetCost * materialUsage; // PLN
-  }, [sheetCost, materialUsage]);
+  const materialUsage = clamp(totalArea / Math.max(1e-9, sheetArea), 0, 1);
+  const materialCostOrder = selectedMaterial.sheetCost * materialUsage;
 
   const timeAndEnergyTotals = useMemo(() => {
     let minutes = setupMinutes;
-    for (const it of instances) {
-      const d = designs.find((x) => x.id === it.designId);
-      const m = d?.minutesOverride ?? baseMinutesPerItem;
-      minutes += m;
+    for (const l of layout) {
+      const d = designs.find((x) => x.id === l.designId);
+      minutes += d?.minutesOverride ?? baseMinutesPerItem;
     }
-
     const hours = minutes / 60;
     const kwh = ((laserWatt + assistWatt) / 1000) * hours;
-
     return { minutes, hours, kwh };
-  }, [instances, designs, baseMinutesPerItem, setupMinutes, laserWatt, assistWatt]);
+  }, [layout, designs, baseMinutesPerItem, setupMinutes, laserWatt, assistWatt]);
 
-  const orderCostsTime = useMemo(() => {
-    const energy = timeAndEnergyTotals.kwh * powerPrice;
-    const depr = timeAndEnergyTotals.hours * deprPerHour;
-    const labor = timeAndEnergyTotals.hours * laborPerHour;
+  const orderCostsTime = (timeAndEnergyTotals.kwh * powerPrice) + (timeAndEnergyTotals.hours * deprPerHour) + (timeAndEnergyTotals.hours * laborPerHour);
+  const productionCost = orderCostsTime + materialCostOrder;
 
-    return { energy, depr, labor, total: energy + depr + labor };
-  }, [timeAndEnergyTotals, powerPrice, deprPerHour, laborPerHour]);
-
-  // koszt produkcji (czas+energia + material) - bez opakowania i dostawy
-  const productionCost = useMemo(() => {
-    return orderCostsTime.total + materialCostOrder;
-  }, [orderCostsTime.total, materialCostOrder]);
-
-  // Dostawa (klient płaci + Ty płacisz kuriera jako koszt)
   const shippingCost = useMemo(() => {
-    if (shippingSize === "none") return 0;
-    if (shippingSize === "A") return Math.max(0, shippingA);
-    if (shippingSize === "B") return Math.max(0, shippingB);
-    return Math.max(0, shippingC);
-  }, [shippingSize, shippingA, shippingB, shippingC]);
+    if (shippingSize === "A") return shippingPrices.A;
+    if (shippingSize === "B") return shippingPrices.B;
+    if (shippingSize === "C") return shippingPrices.C;
+    return 0;
+  }, [shippingSize, shippingPrices]);
 
-  // Baza do marży: produkcja + opakowanie
-  const baseForPricing = useMemo(() => {
-    return productionCost + Math.max(0, packaging);
-  }, [productionCost, packaging]);
+  const baseForPricing = productionCost + packaging;
 
-  // Cena produktu (bez dostawy): albo liczona z marży, albo wpisana ręcznie
   const productPriceGross = useMemo(() => {
-    if (pricingMode === "fixed") {
-      return Math.max(Math.max(0, fixedProductPriceGross), Math.max(0, minOrderPrice));
-    }
-    const withMargin = baseForPricing * (1 + Math.max(0, marginPercent) / 100);
-    return Math.max(withMargin, Math.max(0, minOrderPrice));
+    if (pricingMode === "fixed") return Math.max(fixedProductPriceGross, minOrderPrice);
+    return Math.max(baseForPricing * (1 + marginPercent / 100), minOrderPrice);
   }, [pricingMode, fixedProductPriceGross, baseForPricing, marginPercent, minOrderPrice]);
 
-  // Marża wynikowa (gdy tryb "fixed") — pokazujemy informacyjnie
-  const impliedMarginPercent = useMemo(() => {
-    if (baseForPricing <= 0) return 0;
-    return ((productPriceGross / baseForPricing) - 1) * 100;
-  }, [productPriceGross, baseForPricing]);
+  const customerPaysGross = productPriceGross + shippingCost;
+  const allegroFee = (allegroFeePercent / 100) * customerPaysGross;
+  const tax85 = customerPaysGross * 0.085;
+  const profit = customerPaysGross - (materialCostOrder + packaging + shippingCost + tax85 + vatFromGross(customerPaysGross) - vatFromGross(allegroFee) - vatFromGross(materialCostOrder) - vatFromGross(packaging) + orderCostsTime + allegroFee);
 
-  // Klient placi: produkt + dostawa
-  const customerPaysGross = useMemo(() => {
-    return productPriceGross + shippingCost;
-  }, [productPriceGross, shippingCost]);
+  // --- PDF EXPORT ---
+  async function exportPdfClient() {
+    setIsPdfLoading(true);
+    try {
+        const { id, date } = nowStamp();
+        const doc = new jsPDF({ unit: "mm" });
+        
+        try {
+            const fontBytes = await fetch("https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.1.66/fonts/Roboto/Roboto-Regular.ttf").then(r => r.arrayBuffer());
+            const binary = new Uint8Array(fontBytes).reduce((acc, byte) => acc + String.fromCharCode(byte), '');
+            doc.addFileToVFS("Roboto.ttf", btoa(binary));
+            doc.addFont("Roboto.ttf", "Roboto", "normal");
+            doc.setFont("Roboto");
+        } catch(e) { console.warn("Font loading failed", e); }
 
-  // Allegro fee to KOSZT, liczony od kwoty zaplaconej przez klienta
-  const allegroFee = useMemo(() => {
-    const p = Math.max(0, allegroFeePercent) / 100;
-    return customerPaysGross * p;
-  }, [customerPaysGross, allegroFeePercent]);
+        doc.setFontSize(18); doc.text("OFERTA", 14, 20);
+        doc.setFontSize(10); doc.text(`Data: ${date}`, 14, 26);
 
-  // Podatek 8.5% (ryczalt) od kwoty klienta
-  const TAX_RATE = 0.085;
-  const tax85 = useMemo(() => customerPaysGross * TAX_RATE, [customerPaysGross]);
+        const groupedRows = layout.reduce((acc: any[], curr) => {
+             const d = designs.find(x => x.id === curr.designId);
+             if(!d) return acc;
+             const exist = acc.find(r => r[0] === d.name);
+             if(exist) { exist[1] = String(Number(exist[1])+1); }
+             else { acc.push([d.name, "1", "-", "-"]); }
+             return acc;
+        }, []);
 
-  // VAT 23% wg wzoru
-  const vatCalc = useMemo(() => {
-    const vatSale = vatFromGross(customerPaysGross, 0.23);
-    const vatAllegro = vatFromGross(allegroFee, 0.23);
-    const vatMaterial = vatFromGross(materialCostOrder, 0.23);
-    const vatPackaging = vatFromGross(Math.max(0, packaging), 0.23);
-    return vatSale - vatAllegro - vatMaterial - vatPackaging;
-  }, [customerPaysGross, allegroFee, materialCostOrder, packaging]);
+        const itemPrice = layout.length ? (productPriceGross / layout.length) : 0;
+        groupedRows.forEach(r => { 
+            const count = Number(r[1]);
+            r[2] = fmtPLN(itemPrice); 
+            r[3] = fmtPLN(itemPrice * count); 
+        });
 
-  // Zysk wg Twojego wzoru
-  const profit = useMemo(() => {
-    const revenue = customerPaysGross;
-    const costs =
-      materialCostOrder +
-      Math.max(0, packaging) +
-      shippingCost +
-      tax85 +
-      vatCalc +
-      orderCostsTime.total +
-      allegroFee;
-
-    return revenue - costs;
-  }, [
-    customerPaysGross,
-    materialCostOrder,
-    packaging,
-    shippingCost,
-    tax85,
-    vatCalc,
-    orderCostsTime.total,
-    allegroFee,
-  ]);
-
-  // --------- Baza per projekt (tabelka) ---------
-
-  const perItemPrice = useMemo(() => {
-    if (instances.length === 0) return new Map<string, number>();
-
-    const minutesByInstance = new Map<string, number>();
-    let sumM = 0;
-
-    for (const it of instances) {
-      const d = designs.find((x) => x.id === it.designId);
-      const m = d?.minutesOverride ?? baseMinutesPerItem;
-      minutesByInstance.set(it.instanceId, m);
-      sumM += m;
-    }
-
-    const timeCostPool = orderCostsTime.total;
-
-    const out = new Map<string, number>();
-    for (const it of instances) {
-      const mat = it.w * it.h * materialShare;
-      const m = minutesByInstance.get(it.instanceId) ?? baseMinutesPerItem;
-      const timePart = sumM > 0 ? (m / sumM) * timeCostPool : timeCostPool / instances.length;
-      out.set(it.instanceId, mat + timePart);
-    }
-
-    return out;
-  }, [instances, designs, baseMinutesPerItem, materialShare, orderCostsTime.total]);
-
-  const groupedPrices = useMemo(() => {
-    const byDesign = new Map<string, { name: string; count: number; sum: number }>();
-    for (const it of instances) {
-      const price = perItemPrice.get(it.instanceId) ?? 0;
-      const cur = byDesign.get(it.designId) ?? { name: it.name, count: 0, sum: 0 };
-      cur.count += 1;
-      cur.sum += price;
-      byDesign.set(it.designId, cur);
-    }
-    return Array.from(byDesign.entries()).map(([designId, v]) => ({
-      designId,
-      name: v.name,
-      qty: v.count,
-      unit: v.count ? v.sum / v.count : 0,
-      total: v.sum,
-    }));
-  }, [instances, perItemPrice]);
-
-  // ------------------------- Import / Export -------------------------
-
-  async function onAddSvg(files: FileList | null) {
-    if (!files || files.length === 0) return;
-
-    const next: Design[] = [];
-    for (const f of Array.from(files)) {
-      const text = await f.text();
-      const { w, h } = parseSvgSize(text);
-      next.push({
-        id: makeId(),
-        name: f.name.replace(/\.[^.]+$/, ""),
-        svgText: text,
-        baseW: w,
-        baseH: h,
-        scale: 1,
-        qty: 1,
-      });
-    }
-
-    setDesigns((prev) => [...prev, ...next]);
-  }
-
-  function removeDesign(id: string) {
-    setDesigns((prev) => prev.filter((d) => d.id !== id));
-  }
-
-  function updateDesign(id: string, patch: Partial<Design>) {
-    setDesigns((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
+        autoTable(doc, { 
+            startY: 35, 
+            head: [["Element", "Ilość", "Cena jedn.", "Razem"]], 
+            body: groupedRows, 
+            styles: { font: "Roboto", fontStyle: "normal" },
+            headStyles: { font: "Roboto", fontStyle: "normal", fillColor: [79, 70, 229] }
+        });
+        
+        let y = (doc as any).lastAutoTable.finalY + 10;
+        doc.text(`Dostawa: ${fmtPLN(shippingCost)}`, 14, y);
+        doc.setFontSize(14);
+        doc.text(`RAZEM: ${fmtPLN(customerPaysGross)}`, 14, y + 10);
+        
+        doc.save(`oferta_${id}.pdf`);
+    } finally { setIsPdfLoading(false); }
   }
 
   function exportLayoutSvg() {
-    if (!nesting.ok) return;
-
-    const header = `<?xml version="1.0" encoding="UTF-8"?>\n`;
-    const svgOpen = `<svg xmlns="http://www.w3.org/2000/svg" width="${sheetW}mm" height="${sheetH}mm" viewBox="0 0 ${sheetW} ${sheetH}">\n`;
-    const svgClose = `</svg>\n`;
-
+    if (!layout.length) return;
     const body: string[] = [];
-    body.push(
-      `<rect x="0" y="0" width="${sheetW}" height="${sheetH}" fill="none" stroke="black" stroke-width="0.2"/>`
-    );
-
-    for (const p of nesting.placed) {
+    body.push(`<rect x="0" y="0" width="${sheetW}" height="${sheetH}" fill="none" stroke="black" stroke-width="1"/>`);
+    // @ts-ignore
+    for (const p of layout) {
       const d = designs.find((x) => x.id === p.designId);
       if (!d) continue;
-
-      const inner = d.svgText
-        .replace(/^[\s\S]*?<svg[^>]*>/i, "")
-        .replace(/<\/svg>[\s\S]*$/i, "");
-
-      body.push(`<g transform="translate(${p.x} ${p.y}) scale(${d.scale})">${inner}</g>`);
+      const inner = d.svgText.replace(/^[\s\S]*?<svg[^>]*>/i, "").replace(/<\/svg>[\s\S]*$/i, "");
+      const transform = p.rotated 
+        ? `translate(${p.x + p.h} ${p.y}) rotate(90) scale(${d.scale})`
+        : `translate(${p.x} ${p.y}) scale(${d.scale})`;
+      body.push(`<g transform="${transform}">${inner}</g>`);
     }
-
-    const out = header + svgOpen + body.join("\n") + "\n" + svgClose;
-    downloadText("layout_export.svg", out);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${sheetW}mm" height="${sheetH}mm" viewBox="0 0 ${sheetW} ${sheetH}">${body.join('\n')}</svg>`;
+    const blob = new Blob([svg], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = `nesting_${makeId()}.svg`; a.click();
   }
 
-  function exportPdfClient() {
-    const { id, date, time } = nowStamp();
-
-    // Rozbijamy "cena produktu" na projekty proporcjonalnie (bez dostawy)
-    const baseSum = groupedPrices.reduce((acc, r) => acc + r.total, 0);
-    const productsTarget = Math.max(0, productPriceGross); // cena produktu (bez dostawy)
-    const multiplier = baseSum > 0 ? productsTarget / baseSum : 1;
-
-    const rows = groupedPrices.map((r) => {
-      const unit = r.unit * multiplier;
-      const total = r.total * multiplier;
-      return [r.name, String(r.qty), fmtPLN(unit), fmtPLN(total)];
-    });
-
-    const doc = new jsPDF({ unit: "mm", format: "a4" });
-
-    doc.setFontSize(16);
-    doc.text("WYCENA - LASER CO2", 14, 16);
-
-    doc.setFontSize(10);
-    doc.text(`Numer: ${id}`, 14, 24);
-    doc.text(`Data: ${date} ${time}`, 14, 29);
-    doc.text(`Material: ${selectedMaterial.name}`, 14, 34);
-    doc.text(`Arkusz: ${sheetW} x ${sheetH} mm`, 14, 39);
-
-    autoTable(doc, {
-      startY: 46,
-      head: [["Projekt", "Ilosc", "Cena / szt", "Suma"]],
-      body: rows.length ? rows : [["(brak)", "-", "-", "-"]],
-      styles: { fontSize: 10 },
-      headStyles: { fillColor: [240, 240, 240], textColor: 20 },
-    });
-
-    const y = (doc as any).lastAutoTable?.finalY ?? 46;
-
-    // Dodatkowe pozycje
-    const extraRows: string[][] = [];
-    if (packaging > 0) extraRows.push(["Opakowanie", "1", fmtPLN(packaging), fmtPLN(packaging)]);
-    if (shippingCost > 0)
-      extraRows.push([`Dostawa (${SHIPPING_LABEL[shippingSize]})`, "1", fmtPLN(shippingCost), fmtPLN(shippingCost)]);
-
-    if (extraRows.length) {
-      autoTable(doc, {
-        startY: y + 6,
-        head: [["Dodatkowo", "Ilosc", "Cena", "Suma"]],
-        body: extraRows,
-        styles: { fontSize: 10 },
-        headStyles: { fillColor: [240, 240, 240], textColor: 20 },
-      });
-    }
-
-    const y2 = (doc as any).lastAutoTable?.finalY ?? y + 6;
-
-    doc.setFontSize(11);
-    doc.text(`RAZEM (klient płaci): ${fmtPLN(customerPaysGross)}`, 14, y2 + 10);
-
-    doc.setFontSize(9);
-    doc.text(`Uwagi: wycena orientacyjna. Termin realizacji do ustalenia.`, 14, y2 + 16);
-
-    doc.save(`${id}-wycena.pdf`);
-  }
-
-  // ------------------------- UI -------------------------
+  // --- RENDER ---
 
   return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-900">
-      <div className="max-w-6xl mx-auto p-4 md:p-8">
-        <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-          <div>
-            <h1 className="text-2xl md:text-3xl font-semibold">Kalkulator wyceny + nesting (CO2 / sklejka)</h1>
-            <p className="text-sm text-zinc-600 mt-1">
-              Importuj SVG, ustaw skale i ilosci, a aplikacja ulozy projekty na arkuszu i policzy cene kazdego projektu.
-            </p>
-          </div>
-
-          <div className="flex gap-2 flex-wrap">
-            <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 cursor-pointer">
-              <input
-                type="file"
-                accept="image/svg+xml"
-                multiple
-                className="hidden"
-                onChange={(e) => onAddSvg(e.target.files)}
-              />
-              <span className="text-sm font-medium">Wgraj SVG</span>
-            </label>
-
-            <button
-              className="px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 text-sm font-medium disabled:opacity-50"
-              disabled={!nesting.ok}
-              onClick={exportLayoutSvg}
-            >
-              Eksport ulozenia (SVG)
-            </button>
-
-            <button
-              className="px-3 py-2 rounded-xl bg-white shadow-sm border border-zinc-200 text-sm font-medium"
-              onClick={exportPdfClient}
-            >
-              PDF dla klienta
-            </button>
-          </div>
+    <div className="min-h-screen bg-[#f8fafc] text-slate-900 font-sans select-none flex flex-col">
+      <header className="bg-white border-b sticky top-0 z-50 px-6 py-3 flex justify-between items-center shadow-sm">
+        <div className="flex items-center gap-3">
+            <div className="bg-indigo-600 p-2 rounded text-white"><Scissors size={20}/></div>
+            <h1 className="font-bold text-xl tracking-tight leading-none">
+                <span className="text-slate-900">Wycena</span><span className="text-indigo-600">Cięcia</span>
+            </h1>
         </div>
+        <div className="flex gap-2">
+            <button onClick={() => setIsEditingMaterials(!isEditingMaterials)} className="p-2 border rounded hover:bg-slate-50 flex items-center gap-2 text-sm font-medium"><Edit3 size={16}/> Materiały</button>
+            <label className="bg-slate-900 text-white px-4 py-2 rounded-lg text-sm font-medium cursor-pointer flex items-center gap-2 hover:bg-slate-800"><Plus size={16}/> Dodaj SVG <input type="file" multiple accept=".svg" className="hidden" onChange={async (e) => {
+                const files = Array.from(e.target.files || []);
+                const newD = await Promise.all(files.map(async f => {
+                    const t = await f.text(); const s = parseSvgSize(t);
+                    return { id: makeId(), name: f.name.replace('.svg',''), svgText: t, baseW: s.w, baseH: s.h, scale: 1, qty: 1 };
+                }));
+                setDesigns([...designs, ...newD]);
+            }} /></label>
+        </div>
+      </header>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-6">
-          {/* Left: settings */}
-          <div className="lg:col-span-1 flex flex-col gap-4">
-            <Card title="Parametry arkusza">
-              <Row label="Szerokosc arkusza (mm)">
-                <NumberInput value={sheetW} onChange={setSheetW} min={1} />
-              </Row>
-              <Row label="Wysokosc arkusza (mm)">
-                <NumberInput value={sheetH} onChange={setSheetH} min={1} />
-              </Row>
-              <Row label="Odstep miedzy projektami (mm)">
-                <NumberInput value={padding} onChange={setPadding} min={0} step={0.5} />
-              </Row>
-              <Row label="Kerf (mm) (informacyjnie)">
-                <NumberInput value={kerf} onChange={setKerf} min={0} step={0.01} />
-              </Row>
-
-              <Row label="Material">
-                <select
-                  className="w-full px-3 py-2 rounded-xl border border-zinc-200 bg-white text-sm"
-                  value={materialId}
-                  onChange={(e) => setMaterialId(e.target.value)}
-                >
-                  {materials.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name}
-                    </option>
-                  ))}
-                </select>
-              </Row>
-
-              <Row label="Zoom podgladu">
-                <div className="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min={0.5}
-                    max={2}
-                    step={0.1}
-                    value={viewScale}
-                    onChange={(e) => setViewScale(Number(e.target.value))}
-                    className="w-full"
-                  />
-                  <span className="text-sm tabular-nums w-12 text-right">{viewScale.toFixed(1)}x</span>
-                </div>
-              </Row>
-            </Card>
-
-            <Card title="Koszty (PLN)">
-              <Row label="Cena arkusza (dla wybranego materialu)">
-                <NumberInput value={sheetCost} onChange={setSheetCostForSelected} min={0} step={0.1} />
-              </Row>
-
-              <Row label="Cena pradu (PLN/kWh)">
-                <NumberInput value={powerPrice} onChange={setPowerPrice} min={0} step={0.01} />
-              </Row>
-              <Row label="Amortyzacja (PLN/h)">
-                <NumberInput value={deprPerHour} onChange={setDeprPerHour} min={0} step={0.1} />
-              </Row>
-              <Row label="Godzina pracy (PLN/h)">
-                <NumberInput value={laborPerHour} onChange={setLaborPerHour} min={0} step={0.1} />
-              </Row>
-
-              {/* NOWE: tryb ceny */}
-              <div className="mt-3 rounded-2xl border border-zinc-200 bg-white p-3">
-                <div className="text-sm font-medium mb-2">Ustalanie ceny produktu</div>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setPricingMode("margin")}
-                    className={`px-3 py-2 rounded-xl border text-sm ${
-                      pricingMode === "margin"
-                        ? "bg-zinc-900 text-white border-zinc-900"
-                        : "bg-white text-zinc-900 border-zinc-200"
-                    }`}
-                  >
-                    Marża (%)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPricingMode("fixed")}
-                    className={`px-3 py-2 rounded-xl border text-sm ${
-                      pricingMode === "fixed"
-                        ? "bg-zinc-900 text-white border-zinc-900"
-                        : "bg-white text-zinc-900 border-zinc-200"
-                    }`}
-                  >
-                    Cena produktu (PLN)
-                  </button>
-                </div>
-
-                {pricingMode === "margin" ? (
-                  <div className="mt-3">
-                    <Row label="Marza (%)">
-                      <NumberInput value={marginPercent} onChange={setMarginPercent} min={0} step={1} />
-                    </Row>
-                    <div className="text-xs text-zinc-600 mt-2">
-                      Baza do marży: koszt produkcji + opakowanie = <b>{fmtPLN(baseForPricing)}</b>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="mt-3">
-                    <Row label="Cena produktu (bez dostawy) PLN">
-                      <NumberInput value={fixedProductPriceGross} onChange={setFixedProductPriceGross} min={0} step={0.5} />
-                    </Row>
-                    <div className="text-xs text-zinc-600 mt-2">
-                      Baza: <b>{fmtPLN(baseForPricing)}</b> • Marża wynikowa:{" "}
-                      <b>{Number.isFinite(impliedMarginPercent) ? impliedMarginPercent.toFixed(1) : "0.0"}%</b>
-                    </div>
-                  </div>
-                )}
-
-                <Row label="Minimalna cena (PLN)">
-                  <NumberInput value={minOrderPrice} onChange={setMinOrderPrice} min={0} step={1} />
-                </Row>
-              </div>
-            </Card>
-
-            <Card title="Dostawa / opakowanie / Allegro / podatki">
-              <div className="text-xs text-zinc-600 mb-2">
-                Klient płaci za dostawę (dostawa doliczana do kwoty klienta).
-              </div>
-
-              <div className="grid grid-cols-2 gap-2 mb-3">
-                {(["none", "A", "B", "C"] as ShippingSize[]).map((k) => (
-                  <button
-                    key={k}
-                    type="button"
-                    onClick={() => setShippingSize(k)}
-                    className={`px-3 py-2 rounded-xl border text-sm ${
-                      shippingSize === k
-                        ? "bg-zinc-900 text-white border-zinc-900"
-                        : "bg-white text-zinc-900 border-zinc-200"
-                    }`}
-                  >
-                    {SHIPPING_LABEL[k]}
-                  </button>
-                ))}
-              </div>
-
-              <Row label="Koszt dostawy A (PLN)">
-                <NumberInput value={shippingA} onChange={setShippingA} min={0} step={0.5} />
-              </Row>
-              <Row label="Koszt dostawy B (PLN)">
-                <NumberInput value={shippingB} onChange={setShippingB} min={0} step={0.5} />
-              </Row>
-              <Row label="Koszt dostawy C (PLN)">
-                <NumberInput value={shippingC} onChange={setShippingC} min={0} step={0.5} />
-              </Row>
-
-              <Row label="Opakowanie (PLN)">
-                <NumberInput value={packaging} onChange={setPackaging} min={0} step={0.5} />
-              </Row>
-
-              <Row label="Oplata Allegro (%)">
-                <NumberInput value={allegroFeePercent} onChange={setAllegroFeePercent} min={0} step={0.1} />
-              </Row>
-
-              <div className="mt-2 text-xs text-zinc-600">
-                Podatek: 8,5% • VAT: 23% (wg wzoru)
-              </div>
-            </Card>
-
-            <Card title="Model czasu i energii (uproczony)">
-              <Row label="Laser (W)">
-                <NumberInput value={laserWatt} onChange={setLaserWatt} min={0} step={1} />
-              </Row>
-              <Row label="Dodatkowe odbiorniki (W)">
-                <NumberInput value={assistWatt} onChange={setAssistWatt} min={0} step={1} />
-              </Row>
-              <Row label="Setup na zamowienie (min)">
-                <NumberInput value={setupMinutes} onChange={setSetupMinutes} min={0} step={1} />
-              </Row>
-              <Row label="Czas na sztuke (min) (domyslnie)">
-                <NumberInput value={baseMinutesPerItem} onChange={setBaseMinutesPerItem} min={0} step={0.5} />
-              </Row>
-            </Card>
-          </div>
-
-          {/* Middle: canvas */}
-          <div className="lg:col-span-2 flex flex-col gap-4">
-            <Card title="Ulozenie na arkuszu">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="text-sm text-zinc-700">
-                  {nesting.ok ? (
-                    <span>
-                      Instancje: <b>{instances.length}</b> • Zajete bbox: <b>{(totalArea / 1e6).toFixed(3)} m2</b> • Arkusz:{" "}
-                      <b>{(sheetArea / 1e6).toFixed(3)} m2</b>
-                    </span>
-                  ) : (
-                    <span className="text-rose-700">Nie miesci sie na arkuszu — zmniejsz skale/ilosci lub zwieksz arkusz.</span>
-                  )}
-                </div>
-                <div className="text-sm text-zinc-700 tabular-nums">
-                  Szac. czas: <b>{timeAndEnergyTotals.minutes.toFixed(0)} min</b> • Energia:{" "}
-                  <b>{timeAndEnergyTotals.kwh.toFixed(2)} kWh</b>
-                </div>
-              </div>
-
-              <div className="mt-3 overflow-auto rounded-xl border border-zinc-200 bg-white">
-                <canvas ref={canvasRef} />
-              </div>
-
-              <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
-                <Stat label="Material (proporcjonalnie)" value={fmtPLN(materialCostOrder)} />
-                <Stat label="Czas+energia" value={fmtPLN(orderCostsTime.total)} />
-                <Stat label="Cena produktu" value={fmtPLN(productPriceGross)} />
-                <Stat label="Klient placi" value={fmtPLN(customerPaysGross)} />
-              </div>
-
-              <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
-                <Stat label="Dostawa (wybrana)" value={fmtPLN(shippingCost)} />
-                <Stat label="Allegro (koszt)" value={fmtPLN(allegroFee)} />
-                <Stat label="Podatek 8,5%" value={fmtPLN(tax85)} />
-                <Stat label="VAT (wg wzoru)" value={fmtPLN(vatCalc)} />
-              </div>
-
-              <div className="mt-3">
-                <Stat label="Zysk (po wszystkim)" value={fmtPLN(profit)} />
-              </div>
-            </Card>
-
-            <Card title="Projekty (skala, ilosc, czas)">
-              {designs.length === 0 ? (
-                <div className="text-sm text-zinc-600">
-                  Wgraj jeden lub kilka plikow SVG (np. eksport z LightBurn). Najlepiej, gdy SVG ma poprawny viewBox.
-                </div>
-              ) : (
-                <div className="flex flex-col gap-3">
-                  {designs.map((d) => {
-                    const w = d.baseW * d.scale;
-                    const h = d.baseH * d.scale;
-                    return (
-                      <div key={d.id} className="rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div>
-                            <div className="font-medium">{d.name}</div>
-                            <div className="text-xs text-zinc-600 tabular-nums">
-                              Rozmiar: {w.toFixed(1)} x {h.toFixed(1)} • baza: {d.baseW.toFixed(1)} x {d.baseH.toFixed(1)}
-                            </div>
+      {isEditingMaterials && (
+          <div className="fixed inset-0 bg-black/20 z-50 flex items-start justify-center pt-20 backdrop-blur-sm">
+              <div className="bg-white rounded-xl shadow-2xl p-6 w-[600px] max-w-full">
+                  <div className="flex justify-between items-center mb-4"><h3 className="font-bold text-lg">Edytor Materiałów</h3><button onClick={() => setIsEditingMaterials(false)}><X size={20}/></button></div>
+                  <div className="space-y-2 max-h-[60vh] overflow-y-auto">
+                      {materials.map((m, idx) => (
+                          <div key={m.id} className="grid grid-cols-12 gap-2 items-center bg-slate-50 p-2 rounded">
+                              <input className="col-span-4 bg-white border rounded px-2 py-1 text-sm" value={m.name} onChange={e => { const n = [...materials]; n[idx].name = e.target.value; setMaterials(n); }} />
+                              <div className="col-span-2"><input type="number" className="w-full bg-white border rounded px-1 py-1 text-sm" value={m.sheetCost} onChange={e => { const n = [...materials]; n[idx].sheetCost = Number(e.target.value); setMaterials(n); }} /></div>
+                              <div className="col-span-2"><input type="number" className="w-full bg-white border rounded px-1 py-1 text-sm" value={m.defaultW} onChange={e => { const n = [...materials]; n[idx].defaultW = Number(e.target.value); setMaterials(n); }} /></div>
+                              <div className="col-span-2"><input type="number" className="w-full bg-white border rounded px-1 py-1 text-sm" value={m.defaultH} onChange={e => { const n = [...materials]; n[idx].defaultH = Number(e.target.value); setMaterials(n); }} /></div>
+                              <button className="col-span-2 text-red-500 hover:bg-red-50 p-1 rounded" onClick={() => setMaterials(materials.filter(x => x.id !== m.id))}><Trash2 size={16}/></button>
                           </div>
-                          <button
-                            className="text-sm px-3 py-1.5 rounded-xl border border-zinc-200 hover:bg-zinc-50"
-                            onClick={() => removeDesign(d.id)}
-                          >
-                            Usun
-                          </button>
-                        </div>
-
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
-                          <Labeled label="Skala">
-                            <div className="flex items-center gap-2">
-                              <input
-                                type="range"
-                                min={0.1}
-                                max={3}
-                                step={0.05}
-                                value={d.scale}
-                                onChange={(e) =>
-                                  updateDesign(d.id, { scale: clamp(Number(e.target.value), 0.05, 10) })
-                                }
-                                className="w-full"
-                              />
-                              <span className="text-sm tabular-nums w-14 text-right">{d.scale.toFixed(2)}x</span>
-                            </div>
-                          </Labeled>
-
-                          <Labeled label="Ilosc">
-                            <NumberInput
-                              value={d.qty}
-                              onChange={(v) => updateDesign(d.id, { qty: Math.max(1, Math.floor(v)) })}
-                              min={1}
-                              step={1}
-                            />
-                          </Labeled>
-
-                          <Labeled label="Czas / szt (min) (opcjonalnie)">
-                            <NumberInput
-                              value={d.minutesOverride ?? 0}
-                              onChange={(v) => updateDesign(d.id, { minutesOverride: v <= 0 ? undefined : v })}
-                              min={0}
-                              step={0.5}
-                            />
-                          </Labeled>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </Card>
-
-            <Card title="Wycena per projekt (baza)">
-              {groupedPrices.length === 0 ? (
-                <div className="text-sm text-zinc-600">Dodaj projekty, aby zobaczyc wyceny.</div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="text-left text-zinc-600">
-                        <th className="py-2">Projekt</th>
-                        <th className="py-2">Ilosc</th>
-                        <th className="py-2">Cena / szt</th>
-                        <th className="py-2">Suma</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {groupedPrices.map((r) => (
-                        <tr key={r.designId} className="border-t border-zinc-200">
-                          <td className="py-2 font-medium">{r.name}</td>
-                          <td className="py-2 tabular-nums">{r.qty}</td>
-                          <td className="py-2 tabular-nums">{r.unit.toFixed(2)} PLN</td>
-                          <td className="py-2 tabular-nums">{r.total.toFixed(2)} PLN</td>
-                        </tr>
                       ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-              <p className="text-xs text-zinc-600 mt-2">
-                Baza = rozbicie kosztow czasu+energii + material proporcjonalnie (bbox). Cena klienta jest liczona osobno (cena produktu + dostawa).
-              </p>
-            </Card>
+                  </div>
+                  <button onClick={() => setMaterials([...materials, { id: makeId(), name: "Nowy materiał", sheetCost: 0, defaultW: 600, defaultH: 400 }])} className="mt-4 w-full py-2 border border-dashed border-indigo-300 text-indigo-600 font-bold rounded flex justify-center gap-2"><Plus size={16}/> Dodaj Preset</button>
+              </div>
           </div>
+      )}
+
+      <main className="flex-1 max-w-[1800px] mx-auto p-4 lg:p-6 grid grid-cols-12 gap-6 w-full">
+        <div className="col-span-12 xl:col-span-3 space-y-4 overflow-y-auto h-full">
+            <Section title="Materiał" icon={<Settings2 size={16}/>}>
+                <div className="mb-3"><select className="w-full p-2 border rounded bg-slate-50 text-sm font-medium" value={materialId} onChange={e => handleMaterialChange(e.target.value)}>{materials.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></div>
+                <div className="grid grid-cols-2 gap-2 mb-2"><Input label="Szerokość" val={sheetW} set={setSheetW} /><Input label="Wysokość" val={sheetH} set={setSheetH} /></div>
+                <div className="grid grid-cols-2 gap-2"><Input label="Padding" val={padding} set={setPadding} /><Input label="Koszt Ark." val={selectedMaterial.sheetCost} set={(v: number) => { const n = [...materials]; const idx = n.findIndex(x=>x.id===materialId); if(idx>-1) { n[idx].sheetCost = v; setMaterials(n); } }} /></div>
+            </Section>
+
+            <Section title="Parametry Lasera" icon={<Zap size={16}/>}>
+                <div className="grid grid-cols-2 gap-2 mb-2"><Input label="Setup (min)" val={setupMinutes} set={setSetupMinutes} /><Input label="Czas/szt (min)" val={baseMinutesPerItem} set={setBaseMinutesPerItem} step={0.1} /></div>
+                <div className="grid grid-cols-2 gap-2 mb-2"><Input label="Moc (W)" val={laserWatt} set={setLaserWatt} /><Input label="Assist (W)" val={assistWatt} set={setAssistWatt} /></div>
+                <div className="space-y-2 pt-2 border-t">
+                    <Input label="Prąd (PLN/kWh)" val={powerPrice} set={setPowerPrice} step={0.1}/>
+                    <div className="grid grid-cols-2 gap-2">
+                        <Input label="Amortyzacja/h" val={deprPerHour} set={setDeprPerHour}/>
+                        <Input label="Robocizna/h" val={laborPerHour} set={setLaborPerHour}/>
+                    </div>
+                </div>
+            </Section>
+
+            <Section title="Logistyka" icon={<ShoppingBag size={16}/>}>
+                <div className="grid grid-cols-2 gap-2 mb-2"><Input label="Opakowanie" val={packaging} set={setPackaging}/><Input label="Allegro %" val={allegroFeePercent} set={setAllegroFeePercent} step={0.1}/></div>
+                <div className="mb-2 border-t pt-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Wybierz Gabaryt</label>
+                    <div className="flex bg-slate-100 p-1 rounded mb-2">
+                        {(['none','A','B','C'] as const).map(k => (
+                            <button key={k} onClick={()=>setShippingSize(k)} className={`flex-1 text-xs py-1.5 rounded font-bold ${shippingSize===k ? 'bg-white shadow text-indigo-600':'text-slate-400'}`}>{k==='none'?'-':k}</button>
+                        ))}
+                    </div>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                     <div><label className="text-[9px] text-slate-400 block mb-0.5">Cena A</label><input type="number" className="w-full text-xs border rounded p-1" value={shippingPrices.A} onChange={e => setShippingPrices({...shippingPrices, A: Number(e.target.value)})} /></div>
+                     <div><label className="text-[9px] text-slate-400 block mb-0.5">Cena B</label><input type="number" className="w-full text-xs border rounded p-1" value={shippingPrices.B} onChange={e => setShippingPrices({...shippingPrices, B: Number(e.target.value)})} /></div>
+                     <div><label className="text-[9px] text-slate-400 block mb-0.5">Cena C</label><input type="number" className="w-full text-xs border rounded p-1" value={shippingPrices.C} onChange={e => setShippingPrices({...shippingPrices, C: Number(e.target.value)})} /></div>
+                </div>
+                <div className="mt-2 text-right text-xs text-indigo-600 font-bold">Koszt wysyłki: {fmtPLN(shippingCost)}</div>
+            </Section>
         </div>
 
-        <div className="mt-8 text-xs text-zinc-500">
-          <p>Roadmap: (1) DXF import, (2) liczenie dlugosci sciezek, (3) PDF z fontem PL, (4) lepszy nesting.</p>
+        <div className="col-span-12 xl:col-span-6 flex flex-col gap-4">
+            <div className="bg-white rounded-xl border p-1 shadow-sm relative group overflow-hidden">
+                <div className="bg-slate-100/50 rounded-lg flex justify-center items-center min-h-[500px] relative overflow-auto cursor-crosshair">
+                    <div className="absolute inset-0 pointer-events-none opacity-[0.05]" style={{ backgroundImage: 'radial-gradient(#000 1px, transparent 1px)', backgroundSize: '20px 20px' }}></div>
+                    <canvas 
+                        ref={(c) => {
+                            if(!c) return; canvasRef.current = c;
+                            const ctx = c.getContext("2d"); if(!ctx) return;
+                            const s = Math.min(800/sheetW, 500/sheetH) * viewScale;
+                            c.width = sheetW * s; c.height = sheetH * s;
+                            ctx.fillStyle = "white"; ctx.fillRect(0,0,c.width,c.height);
+                            ctx.strokeStyle = "#94a3b8"; ctx.strokeRect(0,0,c.width,c.height);
+                            
+                            layout.forEach(l => {
+                                 const w = mmToPx(l.rotated ? l.h : l.w, s);
+                                 const h = mmToPx(l.rotated ? l.w : l.h, s);
+                                 const x = mmToPx(l.x, s); const y = mmToPx(l.y, s);
+                                 const isErr = collisions.has(l.instanceId) || l.error;
+                                 ctx.fillStyle = isErr ? "#fecaca" : "#eff6ff"; 
+                                 ctx.fillRect(x,y,w,h);
+                                 ctx.strokeStyle = isErr ? "#ef4444" : "#3b82f6"; ctx.lineWidth = 2; ctx.strokeRect(x,y,w,h);
+                                 const d = designs.find(ds => ds.id === l.designId);
+                                 if(w>20 && d) { ctx.fillStyle= isErr ? "#991b1b" : "#1e3a8a"; ctx.font="10px sans-serif"; ctx.fillText(d.name.substring(0,6), x+2, y+10); }
+                            });
+                        }} 
+                        className="shadow-lg transition-shadow"
+                        onMouseDown={handleMouseDown}
+                        onMouseMove={handleMouseMove}
+                        onMouseUp={handleMouseUp}
+                        onDoubleClick={handleDoubleClick}
+                    />
+                </div>
+                
+                <div className="absolute top-4 right-4 flex gap-2">
+                    <button onClick={runAutoNest} className="p-2 bg-indigo-600 text-white rounded shadow-sm text-xs font-bold flex items-center gap-2 hover:bg-indigo-700"><RefreshCw size={14}/> Auto Nest</button>
+                    <div className="bg-white border rounded p-1 flex"><button onClick={()=>setViewScale(v=>Math.max(0.2, v-0.1))} className="px-2 font-bold">-</button><button onClick={()=>setViewScale(v=>Math.min(3, v+0.1))} className="px-2 font-bold">+</button></div>
+                </div>
+                <div className="absolute top-4 left-4 bg-white/80 backdrop-blur p-2 rounded text-[10px] text-slate-500 pointer-events-none flex items-center gap-2 border"><Move size={12}/> Przesuwaj • 2x Klik Obrót</div>
+            </div>
+
+            <div className="bg-white border rounded-xl p-4 shadow-sm flex-1 overflow-y-auto max-h-[300px]">
+                <h3 className="font-bold text-slate-700 text-sm mb-2">Elementy ({designs.length})</h3>
+                <div className="space-y-2">
+                    {designs.map(d => (
+                        <div key={d.id} className="flex items-center gap-3 bg-slate-50 p-2 rounded border">
+                            <div className="w-8 h-8 bg-white border rounded flex items-center justify-center p-0.5"><div className="w-full h-full opacity-50 pointer-events-none" dangerouslySetInnerHTML={{ __html: d.svgText.replace(/width=".*?"/, 'width="100%"').replace(/height=".*?"/, 'height="100%"') }} /></div>
+                            <div className="flex-1 text-xs font-bold text-slate-700">{d.name}</div>
+                            
+                            <div className="flex flex-col w-16">
+                                <label className="text-[8px] text-slate-400 text-center">Czas(min)</label>
+                                <input type="number" step="0.1" value={d.minutesOverride ?? ""} placeholder={String(baseMinutesPerItem)} onChange={e => { const val = e.target.value === "" ? undefined : Number(e.target.value); setDesigns(designs.map(x=>x.id===d.id?{...x,minutesOverride:val}:x)) }} className="text-center border rounded text-xs py-1" />
+                            </div>
+
+                            <div className="flex flex-col w-12">
+                                <label className="text-[8px] text-slate-400 text-center">Sztuk</label>
+                                <input type="number" value={d.qty} onChange={e=>setDesigns(designs.map(x=>x.id===d.id?{...x,qty:Number(e.target.value)}:x))} className="text-center border rounded text-xs py-1" />
+                            </div>
+                            <div className="flex flex-col w-12">
+                                <label className="text-[8px] text-slate-400 text-center">Skala</label>
+                                <input type="number" step="0.1" value={d.scale} onChange={e=>setDesigns(designs.map(x=>x.id===d.id?{...x,scale:Number(e.target.value)}:x))} className="text-center border rounded text-xs py-1" />
+                            </div>
+                            <button onClick={()=>setDesigns(designs.filter(x=>x.id!==d.id))} className="text-slate-400 hover:text-red-500"><Trash2 size={16}/></button>
+                        </div>
+                    ))}
+                </div>
+            </div>
         </div>
-      </div>
+
+        <div className="col-span-12 xl:col-span-3 space-y-4">
+            <div className="bg-white border rounded-xl p-4 shadow-sm relative overflow-hidden">
+                <div className="bg-gradient-to-r from-indigo-500 to-purple-600 h-1 absolute top-0 left-0 right-0"></div>
+                <div className="flex items-center gap-2 mb-3 text-indigo-700 font-bold uppercase text-xs tracking-wider"><TrendingUp size={16}/> Ceny</div>
+                <div className="flex bg-slate-100 p-1 rounded mb-3">
+                    <button onClick={()=>setPricingMode('margin')} className={`flex-1 py-1.5 text-xs font-bold rounded ${pricingMode==='margin'?'bg-white shadow text-indigo-700':'text-slate-500'}`}>MARŻA %</button>
+                    <button onClick={()=>setPricingMode('fixed')} className={`flex-1 py-1.5 text-xs font-bold rounded ${pricingMode==='fixed'?'bg-white shadow text-indigo-700':'text-slate-500'}`}>STAŁA</button>
+                </div>
+                {pricingMode === 'margin' ? <Input label="Procent Marży" val={marginPercent} set={setMarginPercent} /> : <Input label="Cena Brutto (PLN)" val={fixedProductPriceGross} set={setFixedProductPriceGross} />}
+            </div>
+
+            <div className="bg-slate-900 rounded-xl p-6 text-white shadow-xl">
+                <div className="text-slate-400 text-xs font-bold uppercase mb-1">Cena dla Klienta</div>
+                <div className="text-3xl font-black">{fmtPLN(customerPaysGross)}</div>
+                <div className="mt-6 space-y-2 border-t border-slate-700 pt-4">
+                    <div className="flex justify-between text-base"><span className="text-emerald-400 font-bold">Twój Zysk:</span><span className="font-bold text-emerald-400">{fmtPLN(profit)}</span></div>
+                </div>
+            </div>
+
+            <div className="bg-white border rounded-xl p-4 shadow-sm text-sm space-y-2">
+                <Row label="Materiał" val={materialCostOrder} />
+                <Row label="Praca/Maszyna" val={orderCostsTime} />
+                <Row label="Podatki/Fee" val={tax85 + vatFromGross(customerPaysGross) + allegroFee} />
+                <Row label="Logistyka" val={shippingCost + packaging} isLast />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+                <button onClick={exportLayoutSvg} disabled={!layout.length} className="bg-white border rounded-xl p-3 flex flex-col items-center justify-center hover:bg-slate-50 disabled:opacity-50"><Download className="text-indigo-600 mb-1" size={20}/> <span className="text-xs font-bold">SVG</span></button>
+                <button onClick={exportPdfClient} disabled={isPdfLoading} className="bg-indigo-600 text-white border border-indigo-600 rounded-xl p-3 flex flex-col items-center justify-center hover:bg-indigo-700"><FileText className="text-white mb-1" size={20}/> <span className="text-xs font-bold">{isPdfLoading?'...':'PDF'}</span></button>
+            </div>
+        </div>
+      </main>
+      <footer className="border-t border-slate-200 py-4 text-center text-xs text-slate-400 mt-auto">
+          <p>© 2026 Waldemar Żurek. Wszelkie prawa zastrzeżone.</p>
+      </footer>
     </div>
   );
 }
 
-// ------------------------- UI bits -------------------------
-
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="rounded-3xl bg-white border border-zinc-200 shadow-sm p-4">
-      <div className="font-semibold">{title}</div>
-      <div className="mt-3">{children}</div>
-    </div>
-  );
-}
-
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex items-center justify-between gap-3 py-1.5">
-      <div className="text-sm text-zinc-700">{label}</div>
-      <div className="w-40">{children}</div>
-    </div>
-  );
-}
-
-function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <div className="text-xs text-zinc-600 mb-1">{label}</div>
-      {children}
-    </div>
-  );
-}
-
-function NumberInput({
-  value,
-  onChange,
-  min,
-  max,
-  step,
-}: {
-  value: number;
-  onChange: (v: number) => void;
-  min?: number;
-  max?: number;
-  step?: number;
-}) {
-  return (
-    <input
-      className="w-full px-3 py-2 rounded-xl border border-zinc-200 bg-white text-sm tabular-nums"
-      type="number"
-      value={Number.isFinite(value) ? value : 0}
-      min={min}
-      max={max}
-      step={step}
-      onChange={(e) => onChange(Number(e.target.value))}
-    />
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-2xl border border-zinc-200 bg-white p-3">
-      <div className="text-xs text-zinc-600">{label}</div>
-      <div className="text-base font-semibold tabular-nums mt-0.5">{value}</div>
-    </div>
-  );
-}
+function Section({title,icon,children}:any) { return <div className="bg-white border rounded-xl p-4 shadow-sm"><div className="flex items-center gap-2 mb-3 text-slate-400 font-bold text-xs uppercase">{icon}{title}</div>{children}</div> }
+function Input({label,val,set,step}:any) { return <div><label className="block text-[10px] font-bold text-slate-400 uppercase mb-1">{label}</label><input type="number" step={step} value={val} onChange={e=>set(Number(e.target.value))} className="w-full border rounded p-1.5 text-sm font-bold text-slate-700 bg-slate-50 focus:bg-white focus:border-indigo-500 outline-none tabular-nums"/></div> }
+function Row({label,val,isLast}:any) { return <div className={`flex justify-between ${!isLast?'border-b border-slate-50 pb-2':''} pt-1`}><span className="text-slate-500">{label}</span><span className="font-bold">{fmtPLN(val)}</span></div> }
